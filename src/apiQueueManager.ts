@@ -18,7 +18,7 @@ export type QueuedRequestResult = {
 
 export type DeviceState = {
   lastSuccessfulState?: Control;
-  pendingState?: Control;
+  pendingState?: Partial<Control>;
   lastError?: {
     message: string;
     code: number;

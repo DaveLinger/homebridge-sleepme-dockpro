@@ -22,6 +22,10 @@
     "homebridge-ui",
     "src"
   ],
-  "exclude": ["src/sleepme/client.test.ts", "src/fakeserver/*"],
+"exclude": [
+    "src/sleepme/client.test.ts", 
+    "src/fakeserver/*",
+    "src/**/*.test.ts"
+  ],
   "files": ["src/index.ts"]
 }
