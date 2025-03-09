@@ -349,8 +349,6 @@ export class SleepmePlatformAccessory {
       } else if (!result.success) {
         this.platform.log.error(`Failed to get device status: ${result.error?.message || 'Unknown error'}`);
       }
-    };: ${result.error?.message || 'Unknown error'}`);
-      }
     };
     
     this.apiQueueManager.enqueue(deviceId, 'getDeviceStatus', [], callback);
@@ -387,3 +385,76 @@ export class SleepmePlatformAccessory {
     
     this.apiQueueManager.enqueue(deviceId, 'setThermalControlStatus', [status], callback);
   }
+
+  private publishUpdates() {
+    const s = this.deviceStatus;
+    if (!s) {
+      return;
+    }
+
+    const {Characteristic} = this.platform;
+    const mapper = newMapper(this.platform);
+    
+    const currentState = mapper.toHeatingCoolingState(s);
+    
+    // Update water level service based on type
+    if (this.waterLevelType === 'leak') {
+      this.waterLevelService.updateCharacteristic(
+        Characteristic.LeakDetected,
+        s.status.is_water_low ?
+          Characteristic.LeakDetected.LEAK_DETECTED : 
+          Characteristic.LeakDetected.LEAK_NOT_DETECTED
+      );
+    } else if (this.waterLevelType === 'motion') {
+      this.waterLevelService.updateCharacteristic(
+        Characteristic.MotionDetected,
+        s.status.is_water_low
+      );
+    } else {
+      this.waterLevelService.updateCharacteristic(Characteristic.BatteryLevel, s.status.water_level);
+      this.waterLevelService.updateCharacteristic(Characteristic.StatusLowBattery, s.status.is_water_low);
+    }
+
+    // Update thermostat characteristics
+    this.thermostatService.updateCharacteristic(Characteristic.TemperatureDisplayUnits, 
+      s.control.display_temperature_unit === 'c' ? 0 : 1);
+    this.thermostatService.updateCharacteristic(Characteristic.CurrentHeatingCoolingState, currentState);
+    this.thermostatService.updateCharacteristic(Characteristic.TargetHeatingCoolingState, 
+      s.control.thermal_control_status === 'standby' ? 
+        Characteristic.TargetHeatingCoolingState.OFF : 
+        Characteristic.TargetHeatingCoolingState.AUTO);
+    
+    // Log current water temperature in both units
+    const currentTempC = s.status.water_temperature_c;
+    const currentTempF = (currentTempC * (9/5)) + 32;
+    this.platform.log.debug(`Current water temperature: ${currentTempC}°C (${currentTempF.toFixed(1)}°F)`);
+    this.thermostatService.updateCharacteristic(Characteristic.CurrentTemperature, currentTempC);
+
+    // Handle both high and low temperature special cases
+    const targetTempF = s.control.set_temperature_f;
+    let displayTempC;
+    if (targetTempF >= HIGH_TEMP_TARGET_F) {
+      displayTempC = 46.7;
+    } else if (targetTempF <= LOW_TEMP_TARGET_F) {
+      displayTempC = 12.2; // 54°F in Celsius
+    } else {
+      displayTempC = s.control.set_temperature_c;
+    }
+    this.platform.log.debug(`Target temperature: ${displayTempC}°C (${targetTempF}°F)`);
+    this.thermostatService.updateCharacteristic(Characteristic.TargetTemperature, displayTempC);
+    
+    // Only log if the heating/cooling state has changed
+    if (this.previousHeatingCoolingState !== currentState) {
+      this.platform.log(`Updated heating/cooling state to: ${currentState} (0=OFF, 1=HEAT, 2=COOL)`);
+      this.previousHeatingCoolingState = currentState;
+    }
+    
+    // Check if there was an error with the API
+    const deviceState = this.apiQueueManager.getDeviceState(this.accessory.context.device.id);
+    if (deviceState.lastError) {
+      this.platform.log.warn(
+        `Device ${this.accessory.displayName} has API error: ${deviceState.lastError.code} - ${deviceState.lastError.message}`
+      );
+    }
+  }
+}
