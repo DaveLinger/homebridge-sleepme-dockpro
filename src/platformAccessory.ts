@@ -349,6 +349,8 @@ export class SleepmePlatformAccessory {
       } else if (!result.success) {
         this.platform.log.error(`Failed to get device status: ${result.error?.message || 'Unknown error'}`);
       }
+    };: ${result.error?.message || 'Unknown error'}`);
+      }
     };
     
     this.apiQueueManager.enqueue(deviceId, 'getDeviceStatus', [], callback);
