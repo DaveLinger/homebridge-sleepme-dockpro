@@ -8,6 +8,11 @@ import {SleepmePlatformAccessory} from './platformAccessory.js';
 export type PluginConfig = {
   api_keys: string[];
   platform: string;
+  water_level_type?: 'battery' | 'leak' | 'motion';
+  slow_polling_interval_minutes?: number;
+  api_request_interval_ms?: number;
+  max_api_retries?: number;
+  api_retry_backoff_ms?: number;
 };
 
 const validateConfig = (config: any):[boolean, string] => {

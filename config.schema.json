@@ -27,6 +27,28 @@
         "description": "Set the interval (in minutes) for passive polling of the Sleepme API.",
         "default": 15,
         "minimum": 1
+      },
+      "api_request_interval_ms": {
+        "title": "API Request Interval (Milliseconds)",
+        "type": "number",
+        "description": "Minimum time between API requests (rate limiting).",
+        "default": 1000,
+        "minimum": 500
+      },
+      "max_api_retries": {
+        "title": "Maximum API Retries",
+        "type": "number",
+        "description": "Number of times to retry a failed API request.",
+        "default": 3,
+        "minimum": 0,
+        "maximum": 10
+      },
+      "api_retry_backoff_ms": {
+        "title": "API Retry Backoff (Milliseconds)",
+        "type": "number",
+        "description": "Base time to wait before retrying a failed API request. Each retry will wait this amount multiplied by the retry count.",
+        "default": 5000,
+        "minimum": 1000
       }
     }
   }

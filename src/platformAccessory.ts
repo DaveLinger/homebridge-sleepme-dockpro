@@ -2,6 +2,7 @@ import {CharacteristicValue, PlatformAccessory, Service} from 'homebridge';
 
 import {SleepmePlatform} from './platform.js';
 import {Client, Control, Device, DeviceStatus} from './sleepme/client.js';
+import {ApiQueueManager, RequestCallback} from './apiQueueManager.js';
 
 type SleepmeContext = {
   device: Device;
@@ -11,6 +12,9 @@ type SleepmeContext = {
 interface PlatformConfig {
   water_level_type?: 'battery' | 'leak' | 'motion';
   slow_polling_interval_minutes?: number;
+  api_request_interval_ms?: number;
+  max_api_retries?: number;
+  api_retry_backoff_ms?: number;
 }
 
 interface Mapper {
@@ -66,6 +70,9 @@ const HIGH_TEMP_THRESHOLD_F = 115;
 const HIGH_TEMP_TARGET_F = 999;
 const LOW_TEMP_THRESHOLD_F = 55;
 const LOW_TEMP_TARGET_F = -1;
+const DEFAULT_API_REQUEST_INTERVAL_MS = 1000; // 1 second minimum between API requests
+const DEFAULT_MAX_API_RETRIES = 3;
+const DEFAULT_API_RETRY_BACKOFF_MS = 5000; // 5 seconds
 
 export class SleepmePlatformAccessory {
   private thermostatService: Service;
@@ -75,6 +82,7 @@ export class SleepmePlatformAccessory {
   private timeout: NodeJS.Timeout | undefined;
   private readonly waterLevelType: 'battery' | 'leak' | 'motion';
   private readonly slowPollingIntervalMs: number;
+  private readonly apiQueueManager: ApiQueueManager;
   private previousHeatingCoolingState: number | null = null;
 
   constructor(
@@ -106,9 +114,25 @@ export class SleepmePlatformAccessory {
       this.platform.log.debug(`Using default slow polling interval of ${DEFAULT_SLOW_POLLING_INTERVAL_MINUTES} minutes`);
     }
 
+    // Set up API queue manager
+    const apiRequestInterval = config.api_request_interval_ms || DEFAULT_API_REQUEST_INTERVAL_MS;
+    const maxApiRetries = config.max_api_retries || DEFAULT_MAX_API_RETRIES;
+    const apiRetryBackoff = config.api_retry_backoff_ms || DEFAULT_API_RETRY_BACKOFF_MS;
+    
+    this.apiQueueManager = new ApiQueueManager(
+      client,
+      this.platform.log,
+      apiRequestInterval,
+      maxApiRetries,
+      apiRetryBackoff
+    );
+
     // Debug log the configuration
     this.platform.log.debug('Configuration:', JSON.stringify(config));
     this.platform.log.debug(`Water level type configured as: ${this.waterLevelType}`);
+    this.platform.log.debug(`API request interval: ${apiRequestInterval}ms`);
+    this.platform.log.debug(`Max API retries: ${maxApiRetries}`);
+    this.platform.log.debug(`API retry backoff: ${apiRetryBackoff}ms`);
 
     // Initialize service bindings first
     this.thermostatService = this.accessory.getService(this.platform.Service.Thermostat) ||
@@ -174,25 +198,16 @@ export class SleepmePlatformAccessory {
       .setCharacteristic(Characteristic.SerialNumber, device.id);
 
     // Initialize all characteristic handlers after services are created
-    this.initializeCharacteristics(client, device);
+    this.initializeCharacteristics(device);
 
     // Get initial device status
-    client.getDeviceStatus(device.id)
-      .then(statusResponse => {
-        this.deviceStatus = statusResponse.data;
-        this.publishUpdates();
-      });
+    this.enqueueGetDeviceStatus(device.id);
 
     // Set up polling
-    this.scheduleNextCheck(async () => {
-      this.platform.log(`polling device status for ${this.accessory.displayName}`)
-      const r = await client.getDeviceStatus(device.id);
-      this.platform.log(`response (${this.accessory.displayName}): ${r.status}`)
-      return r.data
-    });
+    this.scheduleNextCheck(device.id);
   }
 
-  private initializeCharacteristics(client: Client, device: Device) {
+  private initializeCharacteristics(device: Device) {
     const {Characteristic} = this.platform;
 
     // Initialize water level characteristics based on type
@@ -240,13 +255,16 @@ export class SleepmePlatformAccessory {
         .orElse(Characteristic.TargetHeatingCoolingState.OFF))
       .onSet(async (value: CharacteristicValue) => {
         const targetState = (value === Characteristic.TargetHeatingCoolingState.OFF) ? 'standby' : 'active';
-        this.platform.log(`setting TargetHeatingCoolingState for ${this.accessory.displayName} to ${targetState} (${value})`);
+        this.platform.log(`Setting TargetHeatingCoolingState for ${this.accessory.displayName} to ${targetState} (${value})`);
         
-        return client.setThermalControlStatus(device.id, targetState)
-          .then(r => {
-            this.platform.log(`response (${this.accessory.displayName}): ${r.status}`);
-            this.updateControlFromResponse(r);
-          });
+        // Immediately update UI, then enqueue the actual API request
+        if (this.deviceStatus) {
+          this.deviceStatus.control.thermal_control_status = targetState;
+          this.publishUpdates();
+        }
+        
+        this.lastInteractionTime = new Date();
+        this.enqueueSetThermalControlStatus(device.id, targetState);
       });
 
     this.thermostatService.getCharacteristic(Characteristic.CurrentTemperature)
@@ -270,7 +288,7 @@ export class SleepmePlatformAccessory {
           }
           const tempC = ds.control.set_temperature_c;
           const tempF = (tempC * (9/5)) + 32;
-          this.platform.log(`Current target temperature: ${tempC}°C (${tempF.toFixed(1)}°F)`);
+          this.platform.log.debug(`Current target temperature: ${tempC}°C (${tempF.toFixed(1)}°F)`);
           return tempC;
         })
         .orElse(21))
@@ -281,22 +299,27 @@ export class SleepmePlatformAccessory {
         // Round to nearest whole number for API call
         tempF = Math.round(tempF);
         
+        // Update UI immediately
+        if (this.deviceStatus) {
+          this.deviceStatus.control.set_temperature_c = tempC;
+          this.deviceStatus.control.set_temperature_f = tempF;
+          this.publishUpdates();
+        }
+        
+        this.lastInteractionTime = new Date();
+        
         // Map temperatures over threshold to HIGH_TEMP_TARGET_F
         // and under threshold to LOW_TEMP_TARGET_F
         if (tempF > HIGH_TEMP_THRESHOLD_F) {
           this.platform.log(`Temperature over ${HIGH_TEMP_THRESHOLD_F}F, mapping to ${HIGH_TEMP_TARGET_F}F for API call`);
-          await client.setTemperatureFahrenheit(device.id, HIGH_TEMP_TARGET_F);
+          this.enqueueSetTemperatureFahrenheit(device.id, HIGH_TEMP_TARGET_F);
         } else if (tempF < LOW_TEMP_THRESHOLD_F) {
           this.platform.log(`Temperature under ${LOW_TEMP_THRESHOLD_F}F, mapping to ${LOW_TEMP_TARGET_F}F for API call`);
-          await client.setTemperatureFahrenheit(device.id, LOW_TEMP_TARGET_F);
+          this.enqueueSetTemperatureFahrenheit(device.id, LOW_TEMP_TARGET_F);
         } else {
           this.platform.log(`Setting temperature to: ${tempC}°C (${tempF}°F)`);
-          await client.setTemperatureFahrenheit(device.id, tempF);
+          this.enqueueSetTemperatureFahrenheit(device.id, tempF);
         }
-        
-        const r = await client.getDeviceStatus(device.id);
-        this.deviceStatus = r.data;  // Update full device status
-        this.publishUpdates();
       });
 
     this.thermostatService.getCharacteristic(Characteristic.TemperatureDisplayUnits)
@@ -305,92 +328,60 @@ export class SleepmePlatformAccessory {
         .orElse(1));
   }
 
-private scheduleNextCheck(poller: () => Promise<DeviceStatus>) {
+  private scheduleNextCheck(deviceId: string) {
     const timeSinceLastInteractionMS = new Date().valueOf() - this.lastInteractionTime.valueOf();
     clearTimeout(this.timeout);
     this.timeout = setTimeout(() => {
-      this.platform.log(`polling at: ${new Date()}`);
-      this.platform.log(`last interaction at: ${this.lastInteractionTime}`);
-      poller().then(s => {
-        this.deviceStatus = s;
-        this.publishUpdates();
-        this.platform.log(`Current thermal control status: ${s.control.thermal_control_status}`);
-      }).then(() => {
-        this.scheduleNextCheck(poller);
-      });
+      this.platform.log.debug(`Polling at: ${new Date()}`);
+      this.platform.log.debug(`Last interaction at: ${this.lastInteractionTime}`);
+      
+      this.enqueueGetDeviceStatus(deviceId);
+      this.scheduleNextCheck(deviceId);
     }, timeSinceLastInteractionMS < POLLING_RECENCY_THRESHOLD_MS ? FAST_POLLING_INTERVAL_MS : this.slowPollingIntervalMs);
   }
 
-  private updateControlFromResponse(response: { data: Control }) {
-    if (this.deviceStatus) {
-      this.deviceStatus.control = response.data;
-      this.platform.log(`Updated control status: ${response.data.thermal_control_status}`);
-    }
-    this.lastInteractionTime = new Date();
-    this.publishUpdates();
+  // API Queue Methods
+  private enqueueGetDeviceStatus(deviceId: string) {
+    const callback: RequestCallback = (result) => {
+      if (result.success && result.data && 'status' in result.data) {
+        this.deviceStatus = result.data as DeviceStatus;
+        this.publishUpdates();
+      } else if (!result.success) {
+        this.platform.log.error(`Failed to get device status: ${result.error?.message || 'Unknown error'}`);
+      }
+    };
+    
+    this.apiQueueManager.enqueue(deviceId, 'getDeviceStatus', [], callback);
   }
-
-  private publishUpdates() {
-    const s = this.deviceStatus;
-    if (!s) {
-      return;
-    }
-
-    const {Characteristic} = this.platform;
-    const mapper = newMapper(this.platform);
+  
+  private enqueueSetTemperatureFahrenheit(deviceId: string, temperature: number) {
+    const callback: RequestCallback = (result) => {
+      if (result.success && result.data) {
+        if (this.deviceStatus) {
+          this.deviceStatus.control = result.data as Control;
+          this.publishUpdates();
+        }
+      } else if (!result.success) {
+        this.platform.log.error(`Failed to set temperature: ${result.error?.message || 'Unknown error'}`);
+        this.enqueueGetDeviceStatus(deviceId); // Get current state if update failed
+      }
+    };
     
-    const currentState = mapper.toHeatingCoolingState(s);
-    
-    // Update water level service based on type
-    if (this.waterLevelType === 'leak') {
-      this.waterLevelService.updateCharacteristic(
-        Characteristic.LeakDetected,
-        s.status.is_water_low ?
-          Characteristic.LeakDetected.LEAK_DETECTED : 
-          Characteristic.LeakDetected.LEAK_NOT_DETECTED
-      );
-    } else if (this.waterLevelType === 'motion') {
-      this.waterLevelService.updateCharacteristic(
-        Characteristic.MotionDetected,
-        s.status.is_water_low
-      );
-    } else {
-      this.waterLevelService.updateCharacteristic(Characteristic.BatteryLevel, s.status.water_level);
-      this.waterLevelService.updateCharacteristic(Characteristic.StatusLowBattery, s.status.is_water_low);
-    }
-
-    // Update thermostat characteristics
-    this.thermostatService.updateCharacteristic(Characteristic.TemperatureDisplayUnits, 
-      s.control.display_temperature_unit === 'c' ? 0 : 1);
-    this.thermostatService.updateCharacteristic(Characteristic.CurrentHeatingCoolingState, currentState);
-    this.thermostatService.updateCharacteristic(Characteristic.TargetHeatingCoolingState, 
-      s.control.thermal_control_status === 'standby' ? 
-        Characteristic.TargetHeatingCoolingState.OFF : 
-        Characteristic.TargetHeatingCoolingState.AUTO);
-    
-    // Log current water temperature in both units
-    const currentTempC = s.status.water_temperature_c;
-    const currentTempF = (currentTempC * (9/5)) + 32;
-    this.platform.log(`Current water temperature: ${currentTempC}°C (${currentTempF.toFixed(1)}°F)`);
-    this.thermostatService.updateCharacteristic(Characteristic.CurrentTemperature, currentTempC);
-
-    // Handle both high and low temperature special cases
-    const targetTempF = s.control.set_temperature_f;
-    let displayTempC;
-    if (targetTempF >= HIGH_TEMP_TARGET_F) {
-      displayTempC = 46.7;
-    } else if (targetTempF <= LOW_TEMP_TARGET_F) {
-      displayTempC = 12.2; // 54°F in Celsius
-    } else {
-      displayTempC = s.control.set_temperature_c;
-    }
-    this.platform.log(`Target temperature: ${displayTempC}°C (${targetTempF}°F)`);
-    this.thermostatService.updateCharacteristic(Characteristic.TargetTemperature, displayTempC);
-    
-    // Only log if the heating/cooling state has changed
-    if (this.previousHeatingCoolingState !== currentState) {
-      this.platform.log(`Updated heating/cooling state to: ${currentState} (0=OFF, 1=HEAT, 2=COOL)`);
-      this.previousHeatingCoolingState = currentState;
-    }
+    this.apiQueueManager.enqueue(deviceId, 'setTemperatureFahrenheit', [temperature], callback);
   }
-}
+  
+  private enqueueSetThermalControlStatus(deviceId: string, status: 'standby' | 'active') {
+    const callback: RequestCallback = (result) => {
+      if (result.success && result.data) {
+        if (this.deviceStatus) {
+          this.deviceStatus.control = result.data as Control;
+          this.publishUpdates();
+        }
+      } else if (!result.success) {
+        this.platform.log.error(`Failed to set thermal control status: ${result.error?.message || 'Unknown error'}`);
+        this.enqueueGetDeviceStatus(deviceId); // Get current state if update failed
+      }
+    };
+    
+    this.apiQueueManager.enqueue(deviceId, 'setThermalControlStatus', [status], callback);
+  }
