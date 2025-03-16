@@ -87,17 +87,15 @@ export class ThermostatService {
           // Check if the response state matches the expected state
           if (responseState !== targetState && this.expectedThermalState === targetState) {
             // State mismatch detected - handle it with multiple retries
-            const controlData = await this.retryService.handleStateMismatch(
+            await this.retryService.handleStateMismatch(
               client, 
               device, 
               targetState, 
               responseState,
               deviceStatus?.control || null
             );
-            return controlData;
           } else {
             this.expectedThermalState = null; // Reset expected state since it matches
-            return response.data;
           }
         } catch (error) {
           this.log.error(`${this.accessory.displayName}: Failed to set thermal control state after retries: ${error instanceof Error ? error.message : String(error)}`);
@@ -109,11 +107,8 @@ export class ThermostatService {
             
             // Notify of the actual state - this will trigger polling interval update
             this.onStateChange(statusResponse.data.control.thermal_control_status === 'active');
-            
-            return statusResponse.data.control;
           } catch (refreshError) {
             this.log.error(`${this.accessory.displayName}: Failed to refresh status after error: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
-            throw refreshError;
           }
         }
       });
@@ -177,22 +172,19 @@ export class ThermostatService {
             
             // Get the full updated status after successful temperature change
             const statusResponse = await client.getDeviceStatus(device.id);
-            return statusResponse.data.control;
+            // Update the local state but don't return it
           } catch (error) {
             this.log.error(`${this.accessory.displayName}: Failed to set temperature after retries: ${error instanceof Error ? error.message : String(error)}`);
             
             // If the API fails after all retries, refresh the status to get the actual state
             try {
-              const statusResponse = await client.getDeviceStatus(device.id);
-              return statusResponse.data.control;
+              await client.getDeviceStatus(device.id);
+              // Just update the local state, don't return anything
             } catch (refreshError) {
               this.log.error(`${this.accessory.displayName}: Failed to refresh status after error: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
-              throw refreshError;
             }
           }
         }
-        
-        return null;
       });
 
     this.service.getCharacteristic(platformCharacteristic.TemperatureDisplayUnits)
