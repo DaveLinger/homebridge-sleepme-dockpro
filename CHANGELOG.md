@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Type safety issue in `Option<T>.orElse()` method
 - `StatusLowBattery` characteristic warning (was passing boolean instead of numeric value)
 - `CurrentTemperature` characteristic NaN warning with improved validation and default fallback
+- `TargetTemperature` characteristic exceeding minimum value - now properly clamps all API temperature values to HomeKit's valid range (12-46.7°C)
 
 ### Changed
 - Enhanced error logging with specific handling for authentication, rate limiting, timeouts, and server errors

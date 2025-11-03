@@ -502,9 +502,8 @@ export class SleepmePlatformAccessory {
           } else if (ds.control.set_temperature_f <= LOW_TEMP_TARGET_F) {
             return 12.2; // 54°F in Celsius
           }
-          const tempC = ds.control.set_temperature_c;
-          // Ensure the reported temperature is within the valid range
-          return this.clampTemperature(tempC, 12, 46.7);
+          // Always clamp the temperature to valid HomeKit range
+          return this.clampTemperature(ds.control.set_temperature_c, 12, 46.7, 21);
         })
         .orElse(21))
       .onSet(async (value: CharacteristicValue) => {
@@ -745,11 +744,18 @@ export class SleepmePlatformAccessory {
     if (this.deviceStatus.control.set_temperature_f >= HIGH_TEMP_TARGET_F) {
       targetTemp = 46.7; // Maximum allowed Celsius temperature
     } else if (this.deviceStatus.control.set_temperature_f <= LOW_TEMP_TARGET_F) {
-      targetTemp = 12.2; // Minimum allowed temperature
+      targetTemp = 12.2; // Minimum allowed temperature (54°F)
     }
     
-    // Apply valid range clamping
-    targetTemp = this.clampTemperature(targetTemp, 12, 46.7);
+    // Check if temperature is out of range before clamping
+    if (targetTemp < 12 || targetTemp > 46.7) {
+      this.platform.log.warn(
+        `${this.accessory.displayName}: API returned out-of-range target temperature: ${targetTemp}°C (${this.deviceStatus.control.set_temperature_f}°F). Clamping to valid range.`
+      );
+    }
+    
+    // Always apply clamping to ensure we never send out-of-range values to HomeKit
+    targetTemp = this.clampTemperature(targetTemp, 12, 46.7, 21);
     this.thermostatService.updateCharacteristic(Characteristic.TargetTemperature, targetTemp);
     
     this.thermostatService.updateCharacteristic(
