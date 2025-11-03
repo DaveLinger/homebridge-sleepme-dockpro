@@ -62,6 +62,7 @@ class Option<T> {
 const DEFAULT_ACTIVE_POLLING_INTERVAL_SECONDS = 45;   // 45 seconds when device is active
 const DEFAULT_STANDBY_POLLING_INTERVAL_MINUTES = 15;  // 15 minutes when device is in standby
 const INITIAL_RETRY_DELAY_MS = 15000;                 // 15 seconds for first retry
+const MAX_RETRY_DELAY_MS = 60000;                     // Cap retry delay at 60 seconds
 const MAX_RETRIES = 3;                                // Maximum number of retry attempts
 const STATE_MISMATCH_RETRY_DELAY_MS = 5000;           // 5 seconds between state mismatch retries
 const MAX_STATE_MISMATCH_RETRIES = 3;                 // Maximum retries for state mismatches
@@ -229,8 +230,9 @@ export class SleepmePlatformAccessory {
     return operation().catch(error => {
       // Retry on any error, not just rate limits
       if (currentAttempt <= maxRetries) {
-        // Calculate exponential backoff delay: 15s, 30s, 60s
-        const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, currentAttempt - 1);
+        // Calculate exponential backoff delay with cap: 15s, 30s, 60s (capped)
+        const uncappedDelay = INITIAL_RETRY_DELAY_MS * Math.pow(2, currentAttempt - 1);
+        const delay = Math.min(uncappedDelay, MAX_RETRY_DELAY_MS);
         
         // Format error message based on status code if available
         let errorDetails = error instanceof Error ? error.message : String(error);
