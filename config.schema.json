@@ -2,45 +2,128 @@
   "pluginAlias": "SleepmeDockProHomebridgePlugin",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "To create Sleepme API keys, set up a developer account [here](https://docs.developer.sleep.me/docs/)",
+  "headerDisplay": "## SleepMe Dock Pro for Homebridge\n\nControl your SleepMe Dock Pro devices through Apple HomeKit.\n\n### Getting Started\n\n1. **Create API Token**: Visit [SleepMe Developer Portal](https://docs.developer.sleep.me/docs/) to create your API token\n2. **Add Token Below**: Paste your API token in the API Keys field\n3. **Save & Restart**: Save configuration and restart Homebridge\n\n### Features\n\n- Control temperature and power state from Apple Home\n- Receive low water level alerts\n- Create HomeKit automations\n- Support for multiple devices\n\n---",
+  "footerDisplay": "### Need Help?\n\n- **Documentation**: [GitHub Repository](https://github.com/DaveLinger/homebridge-sleepme-dockpro)\n- **Issues**: [Report a Bug](https://github.com/DaveLinger/homebridge-sleepme-dockpro/issues)\n- **API Token**: [Create Token](https://docs.developer.sleep.me/docs/)\n\n### Tips\n\n- Use **battery** water level type for most users (shows water % in Home app)\n- Use **leak sensor** type if you want automations triggered by \"leak detected\"\n- Lower polling intervals = more responsive but higher API usage\n- Recommended: Keep default polling intervals unless experiencing rate limiting",
   "schema": {
     "type": "object",
     "properties": {
-		"name": {
-			"description": "Plugin name as displayed in the Homebridge log.",
-			"type": "string",
-			"required": true,
-			"default": "Homebridge Sleepme Dock Pro"
-		},
+      "name": {
+        "title": "Plugin Name",
+        "description": "Name displayed in Homebridge logs",
+        "type": "string",
+        "required": true,
+        "default": "Homebridge Sleepme Dock Pro",
+        "placeholder": "Homebridge Sleepme Dock Pro"
+      },
       "api_keys": {
         "title": "API Keys",
+        "description": "SleepMe API tokens for authentication. Get your token at https://docs.developer.sleep.me/docs/",
         "type": "array",
+        "required": true,
         "items": {
-          "title": "Key",
-          "type": "string"
+          "title": "API Token",
+          "type": "string",
+          "placeholder": "your-api-token-here",
+          "description": "Enter your SleepMe API token"
         }
       },
       "water_level_type": {
-        "title": "Low Water Level Alert Type",
+        "title": "Water Level Alert Type",
         "type": "string",
-        "enum": ["battery", "leak", "motion"],
-        "description": "Select the alert device type for low water level.",
-        "default": "battery"
+        "default": "battery",
+        "oneOf": [
+          {
+            "title": "Battery (Recommended)",
+            "enum": ["battery"],
+            "description": "Shows water level as battery percentage in Home app"
+          },
+          {
+            "title": "Leak Sensor",
+            "enum": ["leak"],
+            "description": "Shows as leak sensor - triggers 'leak detected' when water is low"
+          },
+          {
+            "title": "Motion Sensor",
+            "enum": ["motion"],
+            "description": "Shows as motion sensor - triggers 'motion detected' when water is low"
+          }
+        ],
+        "description": "Choose how low water level alerts appear in HomeKit. Battery shows water %, leak/motion sensors are useful for automations.",
+        "required": false
       },
       "active_polling_interval_seconds": {
-        "title": "Active Device Polling Interval (Seconds)",
+        "title": "Active Polling Interval (Seconds)",
         "type": "number",
-        "description": "Set the interval (in seconds) for polling when device is active/on. Default: 45 seconds",
         "default": 45,
-        "minimum": 10
+        "minimum": 10,
+        "maximum": 300,
+        "required": false,
+        "placeholder": "45",
+        "description": "How often to check device status when active/on. Lower = more responsive but higher API usage. Recommended: 45 seconds."
       },
       "standby_polling_interval_minutes": {
-        "title": "Standby Device Polling Interval (Minutes)",
+        "title": "Standby Polling Interval (Minutes)",
         "type": "number",
-        "description": "Set the interval (in minutes) for polling when device is in standby/off. Default: 15 minutes",
         "default": 15,
-        "minimum": 1
+        "minimum": 1,
+        "maximum": 1440,
+        "required": false,
+        "placeholder": "15",
+        "description": "How often to check device status when in standby/off. Recommended: 15 minutes to reduce API calls."
       }
     }
-  }
+  },
+  "layout": [
+    {
+      "type": "flex",
+      "flex-flow": "row wrap",
+      "items": [
+        {
+          "type": "flex",
+          "flex-flow": "column",
+          "items": ["name"]
+        }
+      ]
+    },
+    {
+      "key": "api_keys",
+      "type": "array",
+      "title": "API Tokens",
+      "description": "Add one or more SleepMe API tokens. Multiple tokens allow you to control devices from different SleepMe accounts.",
+      "buttonText": "Add API Token",
+      "items": [
+        {
+          "type": "string",
+          "placeholder": "Enter your SleepMe API token"
+        }
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Advanced Settings",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        {
+          "key": "water_level_type",
+          "title": "Water Level Alert Type",
+          "description": "💡 Tip: Use 'Battery' for most users. Use 'Leak Sensor' if you want HomeKit automations triggered by low water."
+        },
+        {
+          "type": "help",
+          "helpvalue": "<h5>Polling Intervals</h5><p>The plugin checks your device status at different rates depending on whether it's active or in standby. Adjust these if you experience rate limiting or want more responsive controls.</p><p><strong>Warning:</strong> Setting intervals too low may result in API rate limiting (429 errors).</p>"
+        },
+        {
+          "key": "active_polling_interval_seconds",
+          "title": "Active Mode Polling",
+          "description": "⚡ Check every X seconds when device is ON. Default: 45 seconds."
+        },
+        {
+          "key": "standby_polling_interval_minutes",
+          "title": "Standby Mode Polling",
+          "description": "😴 Check every X minutes when device is OFF. Default: 15 minutes."
+        }
+      ]
+    }
+  ]
 }

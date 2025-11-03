@@ -81,6 +81,19 @@ export class SleepmePlatformAccessory {
   private readonly standbyPollingIntervalMs: number;
   private previousHeatingCoolingState: number | null = null;
   private expectedThermalState: 'standby' | 'active' | null = null; // Track expected state
+  
+  // Metrics tracking
+  private metrics = {
+    apiCalls: {
+      successful: 0,
+      failed: 0,
+      rateLimited: 0,
+      timeout: 0,
+    },
+    lastSuccessfulPoll: null as Date | null,
+    lastFailedPoll: null as Date | null,
+    consecutiveFailures: 0,
+  };
 
   constructor(
     private readonly platform: SleepmePlatform,
@@ -222,6 +235,13 @@ export class SleepmePlatformAccessory {
       this.platform.log.debug(`Response (${this.accessory.displayName}): ${r.status}`)
       return r.data
     });
+    
+    // Log metrics summary every hour for monitoring
+    setInterval(() => {
+      if (this.metrics.apiCalls.successful > 0 || this.metrics.apiCalls.failed > 0) {
+        this.logMetricsSummary('info');
+      }
+    }, 60 * 60 * 1000); // Every hour
   }
 
   // Update the retry helper method in the SleepmePlatformAccessory class
@@ -232,7 +252,22 @@ export class SleepmePlatformAccessory {
     maxRetries: number = MAX_RETRIES, 
     currentAttempt: number = 1
   ): Promise<T> {
-    return operation().catch(error => {
+    return operation().then(result => {
+      // Track successful API call
+      this.metrics.apiCalls.successful++;
+      this.metrics.consecutiveFailures = 0;
+      this.metrics.lastSuccessfulPoll = new Date();
+      return result;
+    }).catch(error => {
+      // Track failed API call
+      const statusCode = (error as any).statusCode;
+      
+      if (statusCode === 429) {
+        this.metrics.apiCalls.rateLimited++;
+      } else if ((error as any).code === 'ECONNABORTED') {
+        this.metrics.apiCalls.timeout++;
+      }
+      
       // Retry on any error, not just rate limits
       if (currentAttempt <= maxRetries) {
         // Calculate exponential backoff delay with cap: 15s, 30s, 60s (capped)
@@ -241,7 +276,6 @@ export class SleepmePlatformAccessory {
         
         // Format error message based on status code if available
         let errorDetails = error instanceof Error ? error.message : String(error);
-        const statusCode = (error as any).statusCode;
         if (statusCode) {
           errorDetails = `HTTP ${statusCode}: ${errorDetails}`;
         }
@@ -261,7 +295,16 @@ export class SleepmePlatformAccessory {
           ));
       }
       
-      // If we've exhausted retries, rethrow
+      // If we've exhausted retries, track the failure and rethrow
+      this.metrics.apiCalls.failed++;
+      this.metrics.consecutiveFailures++;
+      this.metrics.lastFailedPoll = new Date();
+      
+      // Log metrics summary if we have multiple consecutive failures
+      if (this.metrics.consecutiveFailures >= 3) {
+        this.logMetricsSummary('warn');
+      }
+      
       throw error;
     });
   }
@@ -310,6 +353,28 @@ export class SleepmePlatformAccessory {
       return defaultValue;
     }
     return Math.max(min, Math.min(max, value));
+  }
+
+  // Log metrics summary for debugging
+  private logMetricsSummary(level: 'info' | 'warn' = 'info'): void {
+    const total = this.metrics.apiCalls.successful + this.metrics.apiCalls.failed;
+    const successRate = total > 0 ? ((this.metrics.apiCalls.successful / total) * 100).toFixed(1) : '0.0';
+    
+    const message = 
+      `${this.accessory.displayName} API Metrics: ` +
+      `Success: ${this.metrics.apiCalls.successful}, ` +
+      `Failed: ${this.metrics.apiCalls.failed}, ` +
+      `Rate Limited: ${this.metrics.apiCalls.rateLimited}, ` +
+      `Timeout: ${this.metrics.apiCalls.timeout}, ` +
+      `Success Rate: ${successRate}%, ` +
+      `Consecutive Failures: ${this.metrics.consecutiveFailures}, ` +
+      `Last Success: ${this.metrics.lastSuccessfulPoll?.toLocaleString() || 'Never'}`;
+    
+    if (level === 'warn') {
+      this.platform.log.warn(message);
+    } else {
+      this.platform.log.info(message);
+    }
   }
 
   private initializeCharacteristics(client: Client, device: Device) {
