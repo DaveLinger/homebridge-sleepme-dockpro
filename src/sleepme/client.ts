@@ -14,7 +14,10 @@ export class Client {
 
   constructor(token: string, baseURL = 'https://api.developer.sleep.me', log?: Logging) {
     this.token = token;
-    this.axiosClient = axios.create({baseURL: baseURL});
+    this.axiosClient = axios.create({
+      baseURL: baseURL,
+      timeout: 30000, // 30 second timeout to prevent hanging requests
+    });
     this.log = log;
   }
 
