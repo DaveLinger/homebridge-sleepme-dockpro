@@ -9,7 +9,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.1] - 2025-11-3
 
 ### Added
 - Request timeout (30 seconds) to prevent hanging API calls
@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Improved retry logic with exponential backoff capped at 60 seconds to prevent excessive delays
 - Firmware version now automatically updates when device firmware changes
 
+[1.1.1]: https://github.com/DaveLinger/homebridge-sleepme-dockpro/releases/v1.1.1
+
 ## [1.0.4] - 2024-XX-XX
 
 ### Added
@@ -49,5 +51,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Low water level warnings
 - Optimistic UI updates for responsive control
 
-[Unreleased]: https://github.com/DaveLinger/homebridge-sleepme-dockpro/compare/v1.0.4...HEAD
 [1.0.4]: https://github.com/DaveLinger/homebridge-sleepme-dockpro/releases/tag/v1.0.4
