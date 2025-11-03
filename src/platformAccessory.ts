@@ -202,6 +202,11 @@ export class SleepmePlatformAccessory {
     client.getDeviceStatus(device.id)
       .then(statusResponse => {
         this.deviceStatus = statusResponse.data;
+        
+        // Update firmware version in accessory info now that we have device status
+        this.accessory.getService(this.platform.Service.AccessoryInformation)!
+          .setCharacteristic(Characteristic.FirmwareRevision, this.deviceStatus.about.firmware_version);
+        
         this.publishUpdates();
       })
       .catch(error => {
@@ -563,7 +568,15 @@ export class SleepmePlatformAccessory {
       )
       .then(s => {
         const previousState = this.deviceStatus?.control.thermal_control_status;
+        const previousFirmware = this.deviceStatus?.about.firmware_version;
         this.deviceStatus = s;
+        
+        // Update firmware version if it changed
+        if (previousFirmware && s.about.firmware_version !== previousFirmware) {
+          this.platform.log.info(`${this.accessory.displayName}: Firmware updated from ${previousFirmware} to ${s.about.firmware_version}`);
+          this.accessory.getService(this.platform.Service.AccessoryInformation)!
+            .setCharacteristic(this.platform.Characteristic.FirmwareRevision, s.about.firmware_version);
+        }
         
         // Check if we're waiting for a specific thermal state
         if (this.expectedThermalState !== null && s.control.thermal_control_status !== this.expectedThermalState) {
