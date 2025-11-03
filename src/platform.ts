@@ -13,10 +13,16 @@ export type PluginConfig = {
 
 const validateConfig = (config: any):[boolean, string] => {
   if(!config.api_keys || !Array.isArray(config.api_keys)) {
-    return [false, "No API keys configured - plugin will not start"]
+    return [false, "No API keys configured. Please add your SleepMe API token in the plugin settings. Create an API token at: https://docs.developer.sleep.me/docs/"]
+  }
+  if (config.api_keys.length === 0) {
+    return [false, "API keys array is empty. Please add at least one SleepMe API token. Create an API token at: https://docs.developer.sleep.me/docs/"]
   }
   if (config.api_keys.some((s:unknown) => typeof s !== 'string')) {
-    return [false, "Some API keys are invalid"]
+    return [false, "One or more API keys are invalid (must be text strings). Please check your API tokens in the plugin settings."]
+  }
+  if (config.api_keys.some((s:string) => s.trim().length === 0)) {
+    return [false, "One or more API keys are empty. Please remove empty entries and ensure all API tokens are valid."]
   }
   return [true, '']
 }

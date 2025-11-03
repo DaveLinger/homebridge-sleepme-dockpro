@@ -41,7 +41,17 @@ export class Client {
       
       if (this.log) {
         if (status === 429) {
-          this.log.error(`API ${method} ${endpoint} - RATE LIMITED (429): Too many requests. Will retry later.`);
+          this.log.error(`API ${method} ${endpoint} - RATE LIMITED (429): Too many requests. The plugin will automatically retry. Consider increasing polling intervals in settings.`);
+        } else if (status === 401 || status === 403) {
+          this.log.error(`API ${method} ${endpoint} - AUTHENTICATION ERROR (${status}): Invalid API token. Please verify your SleepMe API token in plugin settings. Get a new token at: https://docs.developer.sleep.me/docs/`);
+        } else if (status === 404) {
+          this.log.error(`API ${method} ${endpoint} - NOT FOUND (404): Device or endpoint not found. The device may have been removed from your SleepMe account.`);
+        } else if (status && status >= 500) {
+          this.log.error(`API ${method} ${endpoint} - SERVER ERROR (${status}): SleepMe API is experiencing issues. The plugin will retry automatically.`);
+        } else if (axiosError.code === 'ECONNABORTED') {
+          this.log.error(`API ${method} ${endpoint} - TIMEOUT: Request took longer than 30 seconds. Check your network connection.`);
+        } else if (axiosError.code === 'ENOTFOUND' || axiosError.code === 'ECONNREFUSED') {
+          this.log.error(`API ${method} ${endpoint} - CONNECTION ERROR: Cannot reach SleepMe API. Check your internet connection.`);
         } else {
           this.log.error(`API ${method} ${endpoint} - Error ${status}: ${statusText}`);
         }
