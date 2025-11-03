@@ -53,11 +53,8 @@ class Option<T> {
     return new Option<TNext>(null);
   }
 
-  orElse<T>(elseValue: T): T {
-    if (!this.value) {
-      return elseValue;
-    }
-    return this.value as unknown as T;
+  orElse(elseValue: T): T {
+    return this.value ?? elseValue;
   }
 }
 
@@ -300,7 +297,11 @@ export class SleepmePlatformAccessory {
   }
 
   // Helper method to clamp temperature values to valid range for HomeKit
-  private clampTemperature(value: number, min: number, max: number): number {
+  private clampTemperature(value: number, min: number, max: number, defaultValue: number = 21): number {
+    // Check if value is a valid number
+    if (typeof value !== 'number' || isNaN(value) || !isFinite(value)) {
+      return defaultValue;
+    }
     return Math.max(min, Math.min(max, value));
   }
 
@@ -323,8 +324,10 @@ export class SleepmePlatformAccessory {
     } else {
       this.waterLevelService.getCharacteristic(Characteristic.StatusLowBattery)
         .onGet(() => new Option(this.deviceStatus)
-          .map(ds => ds.status.is_water_low)
-          .orElse(false));
+          .map(ds => ds.status.is_water_low ? 
+            Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW : 
+            Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL)
+          .orElse(Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL));
 
       this.waterLevelService.getCharacteristic(Characteristic.BatteryLevel)
         .onGet(() => new Option(this.deviceStatus)
@@ -648,7 +651,13 @@ export class SleepmePlatformAccessory {
         Characteristic.TargetHeatingCoolingState.AUTO
     );
     
-    const currentTemp = this.clampTemperature(this.deviceStatus.status.water_temperature_c, 12, 46.7);
+    const rawTemp = this.deviceStatus.status.water_temperature_c;
+    if (typeof rawTemp !== 'number' || isNaN(rawTemp) || !isFinite(rawTemp)) {
+      this.platform.log.warn(
+        `${this.accessory.displayName}: Invalid water temperature received: ${rawTemp}. Using default value.`
+      );
+    }
+    const currentTemp = this.clampTemperature(rawTemp, 12, 46.7);
     this.thermostatService.updateCharacteristic(Characteristic.CurrentTemperature, currentTemp);
     
     // Determine target temperature value considering special cases
@@ -685,7 +694,9 @@ export class SleepmePlatformAccessory {
       // Battery service
       this.waterLevelService.updateCharacteristic(
         Characteristic.StatusLowBattery,
-        this.deviceStatus.status.is_water_low
+        this.deviceStatus.status.is_water_low ? 
+          Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW : 
+          Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
       );
       
       this.waterLevelService.updateCharacteristic(
