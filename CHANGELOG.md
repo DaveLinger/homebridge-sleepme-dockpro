@@ -1,3 +1,7 @@
+
+
+## [1.1.2](https://github.com/DaveLinger/homebridge-sleepme-dockpro/compare/v1.1.1...v1.1.2) (2025-11-04)
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
