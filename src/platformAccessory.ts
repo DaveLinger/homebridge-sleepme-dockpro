@@ -62,6 +62,7 @@ class Option<T> {
 const DEFAULT_ACTIVE_POLLING_INTERVAL_SECONDS = 45;   // 45 seconds when device is active
 const DEFAULT_STANDBY_POLLING_INTERVAL_MINUTES = 15;  // 15 minutes when device is in standby
 const INITIAL_RETRY_DELAY_MS = 15000;                 // 15 seconds for first retry
+const MAX_RETRY_DELAY_MS = 60000;                     // Cap retry delay at 60 seconds
 const MAX_RETRIES = 3;                                // Maximum number of retry attempts
 const STATE_MISMATCH_RETRY_DELAY_MS = 5000;           // 5 seconds between state mismatch retries
 const MAX_STATE_MISMATCH_RETRIES = 3;                 // Maximum retries for state mismatches
@@ -80,6 +81,19 @@ export class SleepmePlatformAccessory {
   private readonly standbyPollingIntervalMs: number;
   private previousHeatingCoolingState: number | null = null;
   private expectedThermalState: 'standby' | 'active' | null = null; // Track expected state
+  
+  // Metrics tracking
+  private metrics = {
+    apiCalls: {
+      successful: 0,
+      failed: 0,
+      rateLimited: 0,
+      timeout: 0,
+    },
+    lastSuccessfulPoll: null as Date | null,
+    lastFailedPoll: null as Date | null,
+    consecutiveFailures: 0,
+  };
 
   constructor(
     private readonly platform: SleepmePlatform,
@@ -201,6 +215,11 @@ export class SleepmePlatformAccessory {
     client.getDeviceStatus(device.id)
       .then(statusResponse => {
         this.deviceStatus = statusResponse.data;
+        
+        // Update firmware version in accessory info now that we have device status
+        this.accessory.getService(this.platform.Service.AccessoryInformation)!
+          .setCharacteristic(Characteristic.FirmwareRevision, this.deviceStatus.about.firmware_version);
+        
         this.publishUpdates();
       })
       .catch(error => {
@@ -216,6 +235,13 @@ export class SleepmePlatformAccessory {
       this.platform.log.debug(`Response (${this.accessory.displayName}): ${r.status}`)
       return r.data
     });
+    
+    // Log metrics summary every hour for monitoring
+    setInterval(() => {
+      if (this.metrics.apiCalls.successful > 0 || this.metrics.apiCalls.failed > 0) {
+        this.logMetricsSummary('info');
+      }
+    }, 60 * 60 * 1000); // Every hour
   }
 
   // Update the retry helper method in the SleepmePlatformAccessory class
@@ -226,15 +252,30 @@ export class SleepmePlatformAccessory {
     maxRetries: number = MAX_RETRIES, 
     currentAttempt: number = 1
   ): Promise<T> {
-    return operation().catch(error => {
+    return operation().then(result => {
+      // Track successful API call
+      this.metrics.apiCalls.successful++;
+      this.metrics.consecutiveFailures = 0;
+      this.metrics.lastSuccessfulPoll = new Date();
+      return result;
+    }).catch(error => {
+      // Track failed API call
+      const statusCode = (error as any).statusCode;
+      
+      if (statusCode === 429) {
+        this.metrics.apiCalls.rateLimited++;
+      } else if ((error as any).code === 'ECONNABORTED') {
+        this.metrics.apiCalls.timeout++;
+      }
+      
       // Retry on any error, not just rate limits
       if (currentAttempt <= maxRetries) {
-        // Calculate exponential backoff delay: 15s, 30s, 60s
-        const delay = INITIAL_RETRY_DELAY_MS * Math.pow(2, currentAttempt - 1);
+        // Calculate exponential backoff delay with cap: 15s, 30s, 60s (capped)
+        const uncappedDelay = INITIAL_RETRY_DELAY_MS * Math.pow(2, currentAttempt - 1);
+        const delay = Math.min(uncappedDelay, MAX_RETRY_DELAY_MS);
         
         // Format error message based on status code if available
         let errorDetails = error instanceof Error ? error.message : String(error);
-        const statusCode = (error as any).statusCode;
         if (statusCode) {
           errorDetails = `HTTP ${statusCode}: ${errorDetails}`;
         }
@@ -254,7 +295,16 @@ export class SleepmePlatformAccessory {
           ));
       }
       
-      // If we've exhausted retries, rethrow
+      // If we've exhausted retries, track the failure and rethrow
+      this.metrics.apiCalls.failed++;
+      this.metrics.consecutiveFailures++;
+      this.metrics.lastFailedPoll = new Date();
+      
+      // Log metrics summary if we have multiple consecutive failures
+      if (this.metrics.consecutiveFailures >= 3) {
+        this.logMetricsSummary('warn');
+      }
+      
       throw error;
     });
   }
@@ -303,6 +353,28 @@ export class SleepmePlatformAccessory {
       return defaultValue;
     }
     return Math.max(min, Math.min(max, value));
+  }
+
+  // Log metrics summary for debugging
+  private logMetricsSummary(level: 'info' | 'warn' = 'info'): void {
+    const total = this.metrics.apiCalls.successful + this.metrics.apiCalls.failed;
+    const successRate = total > 0 ? ((this.metrics.apiCalls.successful / total) * 100).toFixed(1) : '0.0';
+    
+    const message = 
+      `${this.accessory.displayName} API Metrics: ` +
+      `Success: ${this.metrics.apiCalls.successful}, ` +
+      `Failed: ${this.metrics.apiCalls.failed}, ` +
+      `Rate Limited: ${this.metrics.apiCalls.rateLimited}, ` +
+      `Timeout: ${this.metrics.apiCalls.timeout}, ` +
+      `Success Rate: ${successRate}%, ` +
+      `Consecutive Failures: ${this.metrics.consecutiveFailures}, ` +
+      `Last Success: ${this.metrics.lastSuccessfulPoll?.toLocaleString() || 'Never'}`;
+    
+    if (level === 'warn') {
+      this.platform.log.warn(message);
+    } else {
+      this.platform.log.info(message);
+    }
   }
 
   private initializeCharacteristics(client: Client, device: Device) {
@@ -430,9 +502,8 @@ export class SleepmePlatformAccessory {
           } else if (ds.control.set_temperature_f <= LOW_TEMP_TARGET_F) {
             return 12.2; // 54°F in Celsius
           }
-          const tempC = ds.control.set_temperature_c;
-          // Ensure the reported temperature is within the valid range
-          return this.clampTemperature(tempC, 12, 46.7);
+          // Always clamp the temperature to valid HomeKit range
+          return this.clampTemperature(ds.control.set_temperature_c, 12, 46.7, 21);
         })
         .orElse(21))
       .onSet(async (value: CharacteristicValue) => {
@@ -561,7 +632,15 @@ export class SleepmePlatformAccessory {
       )
       .then(s => {
         const previousState = this.deviceStatus?.control.thermal_control_status;
+        const previousFirmware = this.deviceStatus?.about.firmware_version;
         this.deviceStatus = s;
+        
+        // Update firmware version if it changed
+        if (previousFirmware && s.about.firmware_version !== previousFirmware) {
+          this.platform.log.info(`${this.accessory.displayName}: Firmware updated from ${previousFirmware} to ${s.about.firmware_version}`);
+          this.accessory.getService(this.platform.Service.AccessoryInformation)!
+            .setCharacteristic(this.platform.Characteristic.FirmwareRevision, s.about.firmware_version);
+        }
         
         // Check if we're waiting for a specific thermal state
         if (this.expectedThermalState !== null && s.control.thermal_control_status !== this.expectedThermalState) {
@@ -665,11 +744,18 @@ export class SleepmePlatformAccessory {
     if (this.deviceStatus.control.set_temperature_f >= HIGH_TEMP_TARGET_F) {
       targetTemp = 46.7; // Maximum allowed Celsius temperature
     } else if (this.deviceStatus.control.set_temperature_f <= LOW_TEMP_TARGET_F) {
-      targetTemp = 12.2; // Minimum allowed temperature
+      targetTemp = 12.2; // Minimum allowed temperature (54°F)
     }
     
-    // Apply valid range clamping
-    targetTemp = this.clampTemperature(targetTemp, 12, 46.7);
+    // Check if temperature is out of range before clamping
+    if (targetTemp < 12 || targetTemp > 46.7) {
+      this.platform.log.warn(
+        `${this.accessory.displayName}: API returned out-of-range target temperature: ${targetTemp}°C (${this.deviceStatus.control.set_temperature_f}°F). Clamping to valid range.`
+      );
+    }
+    
+    // Always apply clamping to ensure we never send out-of-range values to HomeKit
+    targetTemp = this.clampTemperature(targetTemp, 12, 46.7, 21);
     this.thermostatService.updateCharacteristic(Characteristic.TargetTemperature, targetTemp);
     
     this.thermostatService.updateCharacteristic(
