@@ -236,10 +236,10 @@ export class SleepmePlatformAccessory {
       return r.data
     });
     
-    // Log metrics summary every hour for monitoring
+    // Log metrics summary every hour for monitoring (debug level)
     setInterval(() => {
       if (this.metrics.apiCalls.successful > 0 || this.metrics.apiCalls.failed > 0) {
-        this.logMetricsSummary('info');
+        this.logMetricsSummary('debug');
       }
     }, 60 * 60 * 1000); // Every hour
   }
@@ -300,7 +300,7 @@ export class SleepmePlatformAccessory {
       this.metrics.consecutiveFailures++;
       this.metrics.lastFailedPoll = new Date();
       
-      // Log metrics summary if we have multiple consecutive failures
+      // Log metrics summary if we have multiple consecutive failures (warn level to alert user)
       if (this.metrics.consecutiveFailures >= 3) {
         this.logMetricsSummary('warn');
       }
@@ -356,7 +356,7 @@ export class SleepmePlatformAccessory {
   }
 
   // Log metrics summary for debugging
-  private logMetricsSummary(level: 'info' | 'warn' = 'info'): void {
+  private logMetricsSummary(level: 'info' | 'warn' | 'debug' = 'info'): void {
     const total = this.metrics.apiCalls.successful + this.metrics.apiCalls.failed;
     const successRate = total > 0 ? ((this.metrics.apiCalls.successful / total) * 100).toFixed(1) : '0.0';
     
@@ -372,6 +372,8 @@ export class SleepmePlatformAccessory {
     
     if (level === 'warn') {
       this.platform.log.warn(message);
+    } else if (level === 'debug') {
+      this.platform.log.debug(message);
     } else {
       this.platform.log.info(message);
     }
