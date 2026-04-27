@@ -55,10 +55,7 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
     }
 
     this.log.debug('Finished initializing platform:', config.platform);
-    if (!log.success) {
-      log.success = log.info;
-    }
-    this.api.on(didFinishLaunching, () => {
+this.api.on(didFinishLaunching, () => {
       log.debug('Executed didFinishLaunching callback');
       this.discoverDevices();
     });
