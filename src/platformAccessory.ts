@@ -445,22 +445,20 @@ export class SleepmePlatformAccessory {
 
         // Send the command to the API — fires regardless of whether deviceStatus is populated.
         // Not returned: all error paths are handled in .catch() and the handler always resolves void.
+        // The SleepMe PATCH response reflects the device's instantaneous state, not the
+        // commanded state — the device (especially when turning on) takes time to transition.
+        // Validating the response against targetState causes false "state mismatch" loops
+        // that ultimately revert the optimistic update and show "no response" in HomeKit.
+        // Instead: if the API call succeeds (no error thrown), trust the command was accepted
+        // and clear expectedThermalState. The polling logic already preserves expectedThermalState
+        // across polls and will update HomeKit once the device actually confirms the new state.
         this.retryApiCall(
           () => client.setThermalControlStatus(device.id, targetState),
           this.accessory.displayName,
           'set thermal control status'
         )
-          .then(r => {
-            const responseState = r.data.thermal_control_status;
-            if (responseState !== targetState && this.expectedThermalState === targetState) {
-              return this.handleStateMismatch(client, device, targetState, responseState);
-            } else {
-              this.expectedThermalState = null;
-              return r.data;
-            }
-          })
-          .then(controlData => {
-            this.updateControlFromResponse({ data: controlData });
+          .then(() => {
+            this.expectedThermalState = null;
           })
           .catch(error => {
             this.platform.log.error(`${this.accessory.displayName}: Failed to set thermal control state after retries: ${error instanceof Error ? error.message : String(error)}`);
