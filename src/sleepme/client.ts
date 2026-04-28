@@ -135,6 +135,21 @@ export class Client {
     }
   }
 
+  async setDisplayTemperatureUnit(id: string, unit: 'c' | 'f'): Promise<ClientResponse<Control>> {
+    const endpoint = `/v1/devices/${id}`;
+    try {
+      const response = await this.axiosClient.patch<Control>(
+        endpoint,
+        {display_temperature_unit: unit},
+        {headers: this.headers()}
+      );
+      this.logResponse(response, 'PATCH', endpoint);
+      return response;
+    } catch (error) {
+      this.handleError(error, 'PATCH', endpoint);
+    }
+  }
+
   async setThermalControlStatus(id: string, targetState: 'standby' | 'active'): Promise<ClientResponse<Control>> {
     const endpoint = `/v1/devices/${id}`;
     try {

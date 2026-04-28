@@ -542,10 +542,26 @@ export class SleepmePlatformAccessory {
           });
       });
 
+    // TemperatureDisplayUnits is a writable characteristic on Service.Thermostat.
+    // A missing onSet causes HomeKit to receive an error on any bundled write that
+    // includes this characteristic (e.g. the tile quick-toggle), which silently
+    // blocks the entire request — including TargetHeatingCoolingState — producing
+    // "no response" with no log output at all.
     this.thermostatService.getCharacteristic(Characteristic.TemperatureDisplayUnits)
       .onGet(() => new Option(this.deviceStatus)
         .map(ds => ds.control.display_temperature_unit === 'c' ? 0 : 1)
-        .orElse(1));
+        .orElse(1))
+      .onSet((value: CharacteristicValue) => {
+        const unit = value === 0 ? 'c' : 'f';
+        this.platform.log(`${this.accessory.displayName}: Temperature display unit changed to ${unit.toUpperCase()}`);
+        if (this.deviceStatus) {
+          this.deviceStatus.control.display_temperature_unit = unit;
+        }
+        client.setDisplayTemperatureUnit(device.id, unit)
+          .catch(error => {
+            this.platform.log.error(`${this.accessory.displayName}: Failed to set display temperature unit: ${error instanceof Error ? error.message : String(error)}`);
+          });
+      });
   }
 
   // New method to determine which polling interval to use based on device state
