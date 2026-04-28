@@ -6,12 +6,12 @@
   "footerDisplay": "### Need Help?\n\n- **Documentation**: [GitHub Repository](https://github.com/DaveLinger/homebridge-sleepme-dockpro)\n- **Issues**: [Report a Bug](https://github.com/DaveLinger/homebridge-sleepme-dockpro/issues)\n- **API Token**: [Create Token](https://docs.developer.sleep.me/docs/)\n\n### Tips\n\n- Use **battery** water level type for most users (shows water % in Home app)\n- Use **leak sensor** type if you want automations triggered by \"leak detected\"\n- Lower polling intervals = more responsive but higher API usage\n- Recommended: Keep default polling intervals unless experiencing rate limiting",
   "schema": {
     "type": "object",
+    "required": ["name", "api_keys"],
     "properties": {
       "name": {
         "title": "Plugin Name",
         "description": "Name displayed in Homebridge logs",
         "type": "string",
-        "required": true,
         "default": "Homebridge Sleepme Dock Pro",
         "placeholder": "Homebridge Sleepme Dock Pro"
       },
@@ -19,7 +19,6 @@
         "title": "API Keys",
         "description": "SleepMe API tokens for authentication. Get your token at https://docs.developer.sleep.me/docs/",
         "type": "array",
-        "required": true,
         "items": {
           "title": "API Token",
           "type": "string",
@@ -48,8 +47,7 @@
             "description": "Shows as motion sensor - triggers 'motion detected' when water is low"
           }
         ],
-        "description": "Choose how low water level alerts appear in HomeKit. Battery shows water %, leak/motion sensors are useful for automations.",
-        "required": false
+        "description": "Choose how low water level alerts appear in HomeKit. Battery shows water %, leak/motion sensors are useful for automations."
       },
       "active_polling_interval_seconds": {
         "title": "Active Polling Interval (Seconds)",
@@ -57,7 +55,6 @@
         "default": 45,
         "minimum": 10,
         "maximum": 300,
-        "required": false,
         "placeholder": "45",
         "description": "How often to check device status when active/on. Lower = more responsive but higher API usage. Recommended: 45 seconds."
       },
@@ -67,7 +64,6 @@
         "default": 15,
         "minimum": 1,
         "maximum": 1440,
-        "required": false,
         "placeholder": "15",
         "description": "How often to check device status when in standby/off. Recommended: 15 minutes to reduce API calls."
       }
