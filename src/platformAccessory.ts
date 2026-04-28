@@ -416,12 +416,6 @@ export class SleepmePlatformAccessory {
         .orElse(0));
 
     this.thermostatService.getCharacteristic(Characteristic.TargetHeatingCoolingState)
-      .setProps({
-        validValues: [
-          Characteristic.TargetHeatingCoolingState.OFF,  // 0
-          Characteristic.TargetHeatingCoolingState.AUTO  // 3
-        ]
-      })
       .onGet(() => new Option(this.deviceStatus)
         .map(ds => ds.control.thermal_control_status === 'standby' ? 
           Characteristic.TargetHeatingCoolingState.OFF : 
