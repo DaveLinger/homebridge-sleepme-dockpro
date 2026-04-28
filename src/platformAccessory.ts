@@ -430,59 +430,51 @@ export class SleepmePlatformAccessory {
       .onSet(async (value: CharacteristicValue) => {
         const targetState = (value === Characteristic.TargetHeatingCoolingState.OFF) ? 'standby' : 'active';
         this.platform.log(`${this.accessory.displayName}: HomeKit state changed to ${targetState}`);
-        
+
         // Store the expected state
         this.expectedThermalState = targetState;
-        
+
         // Optimistically update the local state first for immediate HomeKit feedback
         if (this.deviceStatus) {
           this.deviceStatus.control.thermal_control_status = targetState;
-          // Trigger UI update without waiting for API
           this.publishUpdates();
-          
-          // When the device state changes, we should update the polling interval immediately
-          this.scheduleNextPollBasedOnState();
+          // Delay the poll reschedule so the device has time to process the command
+          // before we read its state back
+          setTimeout(() => this.scheduleNextPollBasedOnState(), 2000);
         }
-        
-        // Then actually send the command to the API with retry support
-        const setThermalControlOperation = () => client.setThermalControlStatus(device.id, targetState);
-        
+
+        // Send the command to the API — fires regardless of whether deviceStatus is populated.
+        // Not returned: all error paths are handled in .catch() and the handler always resolves void.
         this.retryApiCall(
-          setThermalControlOperation,
+          () => client.setThermalControlStatus(device.id, targetState),
           this.accessory.displayName,
-          "set thermal control status"
+          'set thermal control status'
         )
-        .then(r => {
-          const responseState = r.data.thermal_control_status;
-          
-          // Check if the response state matches the expected state
-          if (responseState !== targetState && this.expectedThermalState === targetState) {
-            // State mismatch detected - handle it with multiple retries
-            return this.handleStateMismatch(client, device, targetState, responseState);
-          } else {
-            this.expectedThermalState = null; // Reset expected state since it matches
-            return r.data;
-          }
-        })
-        .then(controlData => {
-          // Only update based on API response if the state was successfully set
-          this.updateControlFromResponse({ data: controlData });
-        })
-        .catch(error => {
-          this.platform.log.error(`${this.accessory.displayName}: Failed to set thermal control state after retries: ${error instanceof Error ? error.message : String(error)}`);
-          // If the API fails, revert our optimistic update by getting the actual device status
-          return client.getDeviceStatus(device.id)
-            .then(statusResponse => {
-              this.deviceStatus = statusResponse.data;
-              this.expectedThermalState = null; // Clear the expected state
-              this.publishUpdates();
-              // Update the polling schedule based on the actual state
-              this.scheduleNextPollBasedOnState();
-            })
-            .catch(refreshError => {
-              this.platform.log.error(`${this.accessory.displayName}: Failed to refresh status after error: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
-            });
-        });
+          .then(r => {
+            const responseState = r.data.thermal_control_status;
+            if (responseState !== targetState && this.expectedThermalState === targetState) {
+              return this.handleStateMismatch(client, device, targetState, responseState);
+            } else {
+              this.expectedThermalState = null;
+              return r.data;
+            }
+          })
+          .then(controlData => {
+            this.updateControlFromResponse({ data: controlData });
+          })
+          .catch(error => {
+            this.platform.log.error(`${this.accessory.displayName}: Failed to set thermal control state after retries: ${error instanceof Error ? error.message : String(error)}`);
+            return client.getDeviceStatus(device.id)
+              .then(statusResponse => {
+                this.deviceStatus = statusResponse.data;
+                this.expectedThermalState = null;
+                this.publishUpdates();
+                this.scheduleNextPollBasedOnState();
+              })
+              .catch(refreshError => {
+                this.platform.log.error(`${this.accessory.displayName}: Failed to refresh status after error: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
+              });
+          });
       });
 
     this.thermostatService.getCharacteristic(Characteristic.CurrentTemperature)
@@ -510,53 +502,37 @@ export class SleepmePlatformAccessory {
         .orElse(21))
       .onSet(async (value: CharacteristicValue) => {
         const tempC = value as number;
-        let tempF = (tempC * (9 / 5)) + 32;
-        
-        // Round to nearest whole number for API call
-        tempF = Math.round(tempF);
-        
-        // Optimistically update the local state first for immediate HomeKit feedback
+        let tempF = Math.round((tempC * (9 / 5)) + 32);
+
+        // Map to special API values for extremes
+        let apiTemp = tempF;
+        if (tempF > HIGH_TEMP_THRESHOLD_F) {
+          this.platform.log(`${this.accessory.displayName}: Temperature over ${HIGH_TEMP_THRESHOLD_F}F, mapping to ${HIGH_TEMP_TARGET_F}F for API call`);
+          apiTemp = HIGH_TEMP_TARGET_F;
+        } else if (tempF < LOW_TEMP_THRESHOLD_F) {
+          this.platform.log(`${this.accessory.displayName}: Temperature under ${LOW_TEMP_THRESHOLD_F}F, mapping to ${LOW_TEMP_TARGET_F}F for API call`);
+          apiTemp = LOW_TEMP_TARGET_F;
+        } else {
+          this.platform.log(`${this.accessory.displayName}: Setting temperature to: ${tempC}°C (${tempF}°F)`);
+        }
+
+        // Optimistic update — only possible if we already have device state
         if (this.deviceStatus) {
-          // Update the local temperature values
           this.deviceStatus.control.set_temperature_c = tempC;
           this.deviceStatus.control.set_temperature_f = tempF;
-          
-          // Handle special temperature cases
-          let apiTemp = tempF;
-          if (tempF > HIGH_TEMP_THRESHOLD_F) {
-            this.platform.log(`${this.accessory.displayName}: Temperature over ${HIGH_TEMP_THRESHOLD_F}F, mapping to ${HIGH_TEMP_TARGET_F}F for API call`);
-            apiTemp = HIGH_TEMP_TARGET_F;
-          } else if (tempF < LOW_TEMP_THRESHOLD_F) {
-            this.platform.log(`${this.accessory.displayName}: Temperature under ${LOW_TEMP_THRESHOLD_F}F, mapping to ${LOW_TEMP_TARGET_F}F for API call`);
-            apiTemp = LOW_TEMP_TARGET_F;
-          } else {
-            this.platform.log(`${this.accessory.displayName}: Setting temperature to: ${tempC}°C (${tempF}°F)`);
-          }
-          
-          // Trigger UI update without waiting for API
           this.publishUpdates();
-          
-          // Create the API operation function with the correct temperature
-          const setTemperatureOperation = () => client.setTemperatureFahrenheit(device.id, apiTemp);
-          
-          // Call the API with retry support
-          this.retryApiCall(
-            setTemperatureOperation,
-            this.accessory.displayName,
-            "set temperature"
-          )
-          .then(() => {
-            // Get the full updated status after successful temperature change
-            return client.getDeviceStatus(device.id);
-          })
-          .then(statusResponse => {
-            this.deviceStatus = statusResponse.data;
-            this.publishUpdates();
-            this.platform.log(`${this.accessory.displayName}: Successfully updated temperature from API`);
-          })
+        }
+
+        // Send the command to the API — fires regardless of whether deviceStatus is populated.
+        // Not returned: all error paths are handled in .catch() and the handler always resolves void.
+        this.retryApiCall(
+          () => client.setTemperatureFahrenheit(device.id, apiTemp),
+          this.accessory.displayName,
+          'set temperature'
+        )
           .catch(error => {
             this.platform.log.error(`${this.accessory.displayName}: Failed to set temperature after retries: ${error instanceof Error ? error.message : String(error)}`);
-            // If the API fails after all retries, refresh the status to get the actual state
+            // Revert optimistic update by fetching actual device state
             return client.getDeviceStatus(device.id)
               .then(statusResponse => {
                 this.deviceStatus = statusResponse.data;
@@ -566,7 +542,6 @@ export class SleepmePlatformAccessory {
                 this.platform.log.error(`${this.accessory.displayName}: Failed to refresh status after error: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
               });
           });
-        }
       });
 
     this.thermostatService.getCharacteristic(Characteristic.TemperatureDisplayUnits)
