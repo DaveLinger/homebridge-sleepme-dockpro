@@ -52,6 +52,7 @@ const validateConfig = (config: PluginConfig): [boolean, string] => {
 // in order to ensure they weren't added to homebridge already. This event can also be used
 // to start discovery of new accessories.
 const didFinishLaunching = 'didFinishLaunching';
+const shutdown = 'shutdown';
 
 export class SleepmePlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
@@ -64,6 +65,17 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
   // account, so every device behind a token has to share an instance for the limiter
   // to observe the account's real request rate.
   private readonly clients = new Map<string, Client>();
+
+  // Every accessory handler this platform created, so their timers can be
+  // cancelled when Homebridge shuts down.
+  private readonly handlers: SleepmePlatformAccessory[] = [];
+
+  /** Cancels the polling and metrics timers owned by every accessory handler. */
+  public disposeAll(): void {
+    while (this.handlers.length) {
+      this.handlers.pop()?.dispose();
+    }
+  }
 
   /** Returns the shared Client for an API token, creating it on first use. */
   public clientFor(apiKey: string): Client {
@@ -93,6 +105,10 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
     this.api.on(didFinishLaunching, () => {
       log.debug('Executed didFinishLaunching callback');
       this.discoverDevices();
+    });
+    this.api.on(shutdown, () => {
+      log.debug('Shutting down; cancelling accessory timers');
+      this.disposeAll();
     });
   }
 
@@ -209,7 +225,7 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
 
             // create the accessory handler for the restored accessory
             // this is imported from `platformAccessory.ts`
-            new SleepmePlatformAccessory(this, existingAccessory, initialStatus, accepted.length);
+            this.handlers.push(new SleepmePlatformAccessory(this, existingAccessory, initialStatus, accepted.length));
 
             // it is possible to remove platform accessories at any time using `api.unregisterPlatformAccessories`, e.g.:
             // remove platform accessories when no longer present
@@ -228,7 +244,7 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
 
             // create the accessory handler for the newly create accessory
             // this is imported from `platformAccessory.ts`
-            new SleepmePlatformAccessory(this, accessory, initialStatus, accepted.length);
+            this.handlers.push(new SleepmePlatformAccessory(this, accessory, initialStatus, accepted.length));
             // link the accessory to your platform
             this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
           }

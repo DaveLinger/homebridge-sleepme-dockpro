@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- A real test suite: 42 tests across the rate limiter, the platform's discovery filtering and config validation, and the accessory's polling scale, water logging, command suppression, debounce, and behaviour at the rate limit. `npm test` no longer passes vacuously — `--passWithNoTests` is gone, so an empty or broken suite fails CI.
+- `SleepmePlatformAccessory.dispose()` and `SleepmePlatform.disposeAll()`, wired to Homebridge's `shutdown` event, so the plugin cancels its timers on exit instead of leaving them running.
+
 ### Fixed
+- Three timers were started without keeping their handles and so could never be cancelled: the hourly metrics `setInterval`, the 2-second post-command poll reschedule, and the temperature debounce. The reschedule timer is now also replaced rather than stacked, so a burst of power toggles leaves one pending reschedule instead of one per tap.
 - `package-lock.json` still declared version 1.1.7 after the 1.2.0 and 1.3.0 bumps, because those were applied to `package.json` by hand rather than through `release-it`. This would have failed the switch to `npm ci` below.
 - CI installs with `npm ci` instead of `npm install`, so the build is tested against the exact dependency tree described by the lockfile rather than whatever resolves on the day.
 - The "List, audit, fix outdated dependencies and build again" step ran `npm audit fix` and then rebuilt against the mutated tree, which could fail a build for reasons unrelated to the commit and threw the fix away regardless. Its `npm list --outdated` calls were also silently no-ops — `--outdated` is not a flag `npm list` accepts, so it exited 0 without reporting anything. Dependency reporting now lives in a separate `audit` job marked `continue-on-error`, using the real `npm outdated`.
@@ -16,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The build workflow accepts `workflow_dispatch`, so a run can be started by hand from the Actions tab without inventing a commit.
 - Added a `concurrency` group so a burst of pushes to the same branch cancels superseded runs instead of queueing them.
 - Enabled npm caching in `actions/setup-node`.
+- `tsc --noEmit` type-checks the test files, while a new `tsconfig.build.json` keeps them and their shared helpers out of `dist`, so nothing test-related is published.
 
 ## [1.3.0] - 2026-07-26
 

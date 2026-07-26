@@ -22,9 +22,9 @@
   "scripts": {
     "lint": "eslint 'src/**/*.ts' --max-warnings=0",
     "watch": "npm run build && npm link && nodemon",
-    "build": "rm -rf ./dist && tsc && cp node_modules/axios/dist/node/axios.cjs ./dist",
+    "build": "rm -rf ./dist && tsc --project tsconfig.build.json && cp node_modules/axios/dist/node/axios.cjs ./dist",
     "prepublishOnly": "npm run build",
-    "test": "jest --passWithNoTests",
+    "test": "jest",
     "release": "release-it"
   },
   "keywords": [
@@ -43,6 +43,7 @@
     "@eslint/js": "^9.9.0",
     "@release-it/bumper": "^6.0.1",
     "@release-it/conventional-changelog": "^9.0.0",
+    "@types/jest": "^29.5.14",
     "@types/node": ">= 20.14.14 < 21.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",

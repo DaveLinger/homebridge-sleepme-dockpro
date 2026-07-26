@@ -31,6 +31,14 @@ const config: Config = {
     // "node"
   ],
   resolver: "ts-jest-resolver",
+
+  // Accessories own real timers (polling, debounce, the metrics interval). They are
+  // cancelled via dispose()/disposeAll() in the suites' afterEach hooks; this makes
+  // a regression in that cleanup fail loudly instead of hanging the run.
+  testTimeout: 15000,
+
+  // testSupport.ts holds shared doubles, not tests.
+  testPathIgnorePatterns: ["/node_modules/", "<rootDir>/src/testSupport.ts", "<rootDir>/dist/"],
 };
 
 export default config;

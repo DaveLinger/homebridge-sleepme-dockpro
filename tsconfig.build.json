@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "comment": [
+    "Build-only config. tsconfig.json includes the *.test.ts files so that",
+    "`tsc --noEmit` type-checks them; this one leaves them out so they are not",
+    "emitted into dist and shipped to npm."
+  ],
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/testSupport.ts",
+    "src/fakeserver/*"
+  ]
+}

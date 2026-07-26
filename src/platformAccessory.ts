@@ -102,6 +102,8 @@ export class SleepmePlatformAccessory {
   // Coalesces a burst of slider writes into one request (see queueTemperatureCommand)
   private pendingTemperatureF: number | null = null;
   private temperatureDebounce: NodeJS.Timeout | undefined;
+  private metricsInterval: NodeJS.Timeout | undefined;
+  private stateRescheduleTimer: NodeJS.Timeout | undefined;
 
   // Metrics tracking
   private metrics = {
@@ -258,11 +260,31 @@ export class SleepmePlatformAccessory {
     });
 
     // Log metrics summary every hour for monitoring (debug level)
-    setInterval(() => {
+    this.metricsInterval = setInterval(() => {
       if (this.metrics.apiCalls.successful > 0 || this.metrics.apiCalls.failed > 0) {
         this.logMetricsSummary('debug');
       }
     }, 60 * 60 * 1000); // Every hour
+  }
+
+  /**
+   * Cancels every timer this accessory owns: the polling schedule, the pending
+   * temperature write, and the hourly metrics summary.
+   *
+   * The metrics interval used to be started without keeping its handle, so it
+   * could never be cancelled and would accumulate if an accessory were ever
+   * rebuilt. Tests also rely on this to let the event loop drain.
+   */
+  public dispose(): void {
+    clearTimeout(this.timeout);
+    this.timeout = undefined;
+    clearTimeout(this.temperatureDebounce);
+    this.temperatureDebounce = undefined;
+    clearTimeout(this.stateRescheduleTimer);
+    this.stateRescheduleTimer = undefined;
+    clearInterval(this.metricsInterval);
+    this.metricsInterval = undefined;
+    this.pendingTemperatureF = null;
   }
 
   /**
@@ -514,8 +536,13 @@ export class SleepmePlatformAccessory {
           this.deviceStatus.control.thermal_control_status = targetState;
           this.publishUpdates();
           // Delay the poll reschedule so the device has time to process the command
-          // before we read its state back
-          setTimeout(() => this.scheduleNextPollBasedOnState(), 2000);
+          // before we read its state back. Tracked and replaced rather than stacked,
+          // so a burst of toggles leaves exactly one pending reschedule.
+          clearTimeout(this.stateRescheduleTimer);
+          this.stateRescheduleTimer = setTimeout(() => {
+            this.stateRescheduleTimer = undefined;
+            this.scheduleNextPollBasedOnState();
+          }, 2000);
         }
 
         // Send the command to the API — fires regardless of whether deviceStatus is populated.
