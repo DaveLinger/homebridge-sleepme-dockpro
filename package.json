@@ -3,7 +3,7 @@
   "displayName": "Homebridge Sleepme Dock Pro",
   "name": "homebridge-sleepme-dockpro",
   "homepage": "https://github.com/DaveLinger/homebridge-sleepme-dockpro",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Extended HomeKit support for Sleepme Dock Pro devices via Homebridge",
   "license": "Apache-2.0",
   "type": "module",
