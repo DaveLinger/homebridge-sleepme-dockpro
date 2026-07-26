@@ -212,7 +212,9 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
 
         // Pass 2: register. accepted.length is the number of devices sharing this
         // token's 10-requests-per-minute quota.
-        for (const {device, initialStatus} of accepted) {
+        // The index staggers each device's polling so their requests interleave
+        // instead of all firing together; see the accessory constructor.
+        for (const [deviceIndex, {device, initialStatus}] of accepted.entries()) {
           const uuid = this.api.hap.uuid.generate(device.id);
           const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
           if (existingAccessory) {
@@ -225,7 +227,7 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
 
             // create the accessory handler for the restored accessory
             // this is imported from `platformAccessory.ts`
-            this.handlers.push(new SleepmePlatformAccessory(this, existingAccessory, initialStatus, accepted.length));
+            this.handlers.push(new SleepmePlatformAccessory(this, existingAccessory, initialStatus, accepted.length, deviceIndex));
 
             // it is possible to remove platform accessories at any time using `api.unregisterPlatformAccessories`, e.g.:
             // remove platform accessories when no longer present
@@ -244,7 +246,7 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
 
             // create the accessory handler for the newly create accessory
             // this is imported from `platformAccessory.ts`
-            this.handlers.push(new SleepmePlatformAccessory(this, accessory, initialStatus, accepted.length));
+            this.handlers.push(new SleepmePlatformAccessory(this, accessory, initialStatus, accepted.length, deviceIndex));
             // link the accessory to your platform
             this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
           }

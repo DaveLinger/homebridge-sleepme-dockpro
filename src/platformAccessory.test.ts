@@ -39,10 +39,13 @@ afterEach(() => {
 function build(options: {
   deviceCount?: number;
   status?: DeviceStatus;
-  activeSeconds?: number;
+  // Polling keys to merge into the platform config. Defaults to none, so the
+  // built-in default applies; pass the legacy or current key to pin either one.
+  polling?: Record<string, number>;
+  deviceIndex?: number;
   waterLevelType?: string;
 } = {}): Built {
-  const {deviceCount = 1, status = dockProStatus(), activeSeconds = 10} = options;
+  const {deviceCount = 1, deviceIndex = 0, status = dockProStatus(), polling = {}} = options;
   const fake = fakeAccessory();
   const log = recordingLog();
   const patches: Patch[] = [];
@@ -66,13 +69,13 @@ function build(options: {
     Characteristic,
     config: {
       water_level_type: options.waterLevelType ?? 'motion',
-      active_polling_interval_seconds: activeSeconds,
+      ...polling,
     },
     clientFor: () => client,
   } as unknown as SleepmePlatform;
 
   const accessory = new SleepmePlatformAccessory(
-    platform, fake as never, status, deviceCount,
+    platform, fake as never, status, deviceCount, deviceIndex,
   );
   built.push(accessory);
   return {accessory, fake, log, patches};
@@ -85,22 +88,45 @@ const activeIntervalMs = (accessory: SleepmePlatformAccessory): number =>
 const standbyIntervalMs = (accessory: SleepmePlatformAccessory): number =>
   (accessory as unknown as {standbyPollingIntervalMs: number}).standbyPollingIntervalMs;
 
+const initialPollDelayMs = (accessory: SleepmePlatformAccessory): number =>
+  (accessory as unknown as {initialPollDelayMs: number}).initialPollDelayMs;
+
+// Total polling must stay within the account's budget however many devices share
+// the token, so the per-device share is multiplied by the device count.
 describe('polling interval scaling', () => {
-  // Total polling must stay within the account's budget however many devices
-  // share the token, so the floor is per-device.
+  // The default is the per-device share of the budget, so it spends the budget
+  // exactly at any account size. If it ever drifts above that, multi-device
+  // accounts silently under-poll.
   it.each([[1, 10], [2, 20], [3, 30], [4, 40]])(
-    'with %i device(s), a 10s setting becomes %is',
+    'with %i device(s) and no configured interval, the default gives %is',
     (deviceCount, expectedSeconds) => {
       const {accessory} = build({deviceCount});
       expect(activeIntervalMs(accessory)).toBe(expectedSeconds * 1000);
     },
   );
 
-  // Scaling raises an unsafe interval; it must never stretch a safe one, or the
-  // default would get worse for exactly the multi-device users it protects.
-  it('leaves a configured interval that is already above the floor untouched', () => {
-    const {accessory} = build({deviceCount: 2, activeSeconds: 45});
-    expect(activeIntervalMs(accessory)).toBe(45_000);
+  // The point of the rewrite: the configured value is scaled rather than used as
+  // a floor, so every change to it changes behaviour. Under the old semantics
+  // 20 and 10 were indistinguishable for a two-device account.
+  it.each([[1, 40], [2, 80], [3, 120]])(
+    'with %i device(s), a configured 40s gives %is',
+    (deviceCount, expectedSeconds) => {
+      const {accessory} = build({deviceCount, polling: {base_polling_interval_seconds: 40}});
+      expect(activeIntervalMs(accessory)).toBe(expectedSeconds * 1000);
+    },
+  );
+
+  it('doubling the setting doubles the interval at a fixed device count', () => {
+    const single = build({deviceCount: 2, polling: {base_polling_interval_seconds: 10}});
+    const doubled = build({deviceCount: 2, polling: {base_polling_interval_seconds: 20}});
+    expect(activeIntervalMs(doubled.accessory)).toBe(activeIntervalMs(single.accessory) * 2);
+  });
+
+  // A hand-edited config.json bypasses the schema's minimum, so the floor has to
+  // be enforced here too or the account would poll straight through its quota.
+  it('raises a setting below the per-device floor', () => {
+    const {accessory} = build({deviceCount: 2, polling: {base_polling_interval_seconds: 4}});
+    expect(activeIntervalMs(accessory)).toBe(20_000);
   });
 
   it('does not scale standby polling', () => {
@@ -108,9 +134,100 @@ describe('polling interval scaling', () => {
     expect(standbyIntervalMs(accessory)).toBe(15 * 60 * 1000);
   });
 
-  it('explains the adjustment in the log when it raises the interval', () => {
-    const {log} = build({deviceCount: 3});
-    expect(messagesAt(log, 'info').join('\n')).toContain('raised from 10s to 30s');
+});
+
+// Without staggering every device's timer fires together, which spends the whole
+// minute's budget in one burst and leaves nothing for the post-command status read.
+describe('poll staggering', () => {
+  it('offsets each device by one share of the interval', () => {
+    const delays = [0, 1, 2].map(deviceIndex =>
+      initialPollDelayMs(build({deviceCount: 3, deviceIndex}).accessory));
+    // 30s interval across 3 devices: first polls at 30s, 40s, 50s, then every 30s
+    // each, so exactly one request goes out every 10 seconds.
+    expect(delays).toEqual([30_000, 40_000, 50_000]);
+  });
+
+  it('leaves a single device unstaggered', () => {
+    const {accessory} = build({deviceCount: 1});
+    expect(initialPollDelayMs(accessory)).toBe(activeIntervalMs(accessory));
+  });
+
+  // Gaps have to stay even for the legacy interval too, which need not divide
+  // evenly by the device count.
+  it('spreads an interval that does not divide evenly', () => {
+    const delays = [0, 1].map(deviceIndex =>
+      initialPollDelayMs(build({deviceCount: 2, deviceIndex, polling: {active_polling_interval_seconds: 45}}).accessory));
+    expect(delays).toEqual([45_000, 67_500]);
+  });
+
+  // The offset must never push a device past its sibling's next poll, or the
+  // stagger would reorder rather than interleave them.
+  it.each([[2], [3], [4]])('keeps every offset inside one interval (%i devices)', deviceCount => {
+    const last = build({deviceCount, deviceIndex: deviceCount - 1}).accessory;
+    const interval = activeIntervalMs(last);
+    expect(initialPollDelayMs(last)).toBeLessThan(interval * 2);
+    expect(initialPollDelayMs(last)).toBeGreaterThanOrEqual(interval);
+  });
+});
+
+// The deprecated key exists purely so upgrading cannot change the polling rate of
+// an install that had configured one. If any of these drift, a user who never
+// touched their config gets different behaviour from a routine plugin update.
+describe('deprecated active_polling_interval_seconds', () => {
+  const legacy = (n: number) => ({active_polling_interval_seconds: n});
+
+  // Old semantics were max(value, 10 x devices): the scaling was a floor, so a
+  // value above it was used literally rather than multiplied.
+  it.each([
+    [1, 45, 45],
+    [2, 45, 45],
+    [5, 45, 50],
+    [2, 4, 20],
+  ])('with %i device(s), a legacy %is still resolves to %is', (deviceCount, configured, expected) => {
+    const {accessory} = build({deviceCount, polling: legacy(configured)});
+    expect(activeIntervalMs(accessory)).toBe(expected * 1000);
+  });
+
+  it('warns with the exact replacement value when it divides evenly', () => {
+    const {log} = build({deviceCount: 2, polling: legacy(40)});
+    const warning = messagesAt(log, 'warn').join('\n');
+    expect(warning).toContain('unchanged at 40s per device');
+    expect(warning).toContain('\'base_polling_interval_seconds\': 20, which behaves identically');
+  });
+
+  // 45 over two devices is 22.5, which the user cannot enter, so the advice has to
+  // admit it is approximate rather than quietly suggesting a different rate.
+  it('flags the replacement as approximate when it does not divide evenly', () => {
+    const {log} = build({deviceCount: 2, polling: legacy(45)});
+    const warning = messagesAt(log, 'warn').join('\n');
+    expect(warning).toContain('\'base_polling_interval_seconds\': 23');
+    expect(warning).toContain('closest equivalent (46s per device rather than 45s)');
+  });
+
+  // Round-tripping the advice must land back on the same rate, or the warning is
+  // telling users to change something it promised would stay the same.
+  it.each([[1, 45], [2, 40], [3, 90], [4, 200]])(
+    'the suggested replacement reproduces the legacy interval (%i devices, %is)',
+    (deviceCount, configured) => {
+      const {accessory: before, log} = build({deviceCount, polling: legacy(configured)});
+      const suggested = Number(/'base_polling_interval_seconds': (\d+)/.exec(messagesAt(log, 'warn').join('\n'))![1]);
+      const {accessory: after} = build({deviceCount, polling: {base_polling_interval_seconds: suggested}});
+      expect(activeIntervalMs(after)).toBe(activeIntervalMs(before));
+    },
+  );
+
+  it('prefers the current key and says so when both are set', () => {
+    const {accessory, log} = build({
+      deviceCount: 2,
+      polling: {...legacy(45), base_polling_interval_seconds: 30},
+    });
+    expect(activeIntervalMs(accessory)).toBe(60_000);
+    expect(messagesAt(log, 'warn').join('\n')).toContain('Ignoring deprecated');
+  });
+
+  it('says nothing when the deprecated key is absent', () => {
+    const {log} = build({deviceCount: 2});
+    expect(messagesAt(log, 'warn').join('\n')).not.toContain('active_polling_interval_seconds');
   });
 });
 

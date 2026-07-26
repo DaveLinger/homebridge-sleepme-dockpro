@@ -7,8 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-26
+
+### Added
+- Polls from multiple devices are staggered instead of arriving together. Every accessory was constructed in the same synchronous loop, so their timers fired in lockstep: three docks meant three simultaneous requests followed by a quiet stretch, repeating. The minute total was within budget either way, but the burst left no slack for the status read issued two seconds after a command, which was then deferred to the next rate limit window — so confirming that a dock really did what you asked could lag by up to a minute. Each device's first poll is now offset by one share of the interval, spreading requests evenly. HomeKit sees no delay from this: the status fetched during discovery is applied at startup and every read is answered from that cache without an API call.
+
+### Deprecated
+- `active_polling_interval_seconds`, replaced by `base_polling_interval_seconds`. The old key is still read and still behaves exactly as it did, so **upgrading cannot change the polling rate of an existing install** — a config that has it keeps `max(value, 10 × devices)` and logs a warning naming the replacement value that reproduces its current rate. Only the new key appears in the config UI, so saving the form in the UI migrates you to the new setting and its default. The old key is removed in the next major version.
+
+### Changed
+- Default active polling interval lowered from 45 seconds to 10. 1.3.0 added per-device scaling but left the old fixed default in place, which made the two work against each other: 45s is above the safe floor for any realistic account, so the scaling never engaged and every user polled at roughly a quarter of the rate the rate limiter was built to permit. 10 seconds is the single-device floor — 60 seconds divided by the 6-request polling budget — so the scaling now carries it to the correct value for whatever the account holds: 10s with one dock, 20s with two, 30s with three, each landing exactly on the budget with the 4-request command reserve untouched. This only applies while a dock is actively running; standby polling stays at 15 minutes.
+- The polling setting is now a per-device *share* of the account's budget that gets multiplied by the device count, rather than a literal interval with the device count applied as a floor. Under the old rule the floor swallowed any value beneath it, so with four docks everything from 10 to 40 produced identical behaviour and the setting silently ignored what you typed. Now doubling it always doubles the interval, total API usage is `60 / setting` requests per minute regardless of account size, and the default is unchanged for everyone because `max(10, 10 × N)` and `max(10, 10) × N` agree at the default.
+- Trimmed the config UI. Dropped the redundant plugin title and tagline (Homebridge already shows both), the Features list, the Need Help and Tips footer, and the standalone Device Filtering paragraph — the one fact it carried, that non-Dock-Pro models are skipped, now lives in the Supported Models description. The Polling Intervals help is reduced to the line that matters: they are optimized automatically and most users should not change them. Getting Started is unchanged.
+- Removed decorative emoji from field descriptions, and made the field labels consistent between the form and the schema — the two polling fields were titled "Active Mode Polling" and "Standby Mode Polling" in the form while the schema called them "Base/Standby Polling Interval", and the token list was "API Keys" in one place and "API Tokens" in the other.
+
 ### Fixed
+- The **Device ID Allowlist** and **Supported Models** fields in the config UI rendered as a heading and a paragraph with no input and no add button. Both are arrays, and an array in the layout needs an `items` entry describing its element before the form control is drawn — only `api_keys` had one.
+- Odd vertical gap above the **Plugin Name** field, caused by a single-child nested `flex` row/column wrapper in the layout that served no purpose.
 - Declared support for Node 24, which entered LTS in October 2025. Homebridge warned on startup that the plugin's `engines` range did not satisfy the running Node version. The range was stale rather than deliberately exclusive — no code change was needed — and 24.x is now covered by the CI matrix so the claim is tested.
+- README described a "None" option for the water level alert type that has never existed; the choices are battery, leak, and motion.
 
 ## [1.3.0] - 2026-07-26
 

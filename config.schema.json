@@ -2,8 +2,7 @@
   "pluginAlias": "SleepmeDockProHomebridgePlugin",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "## SleepMe Dock Pro for Homebridge\n\nControl your SleepMe Dock Pro devices through Apple HomeKit.\n\n### Getting Started\n\n1. **Create API Token**: Visit [SleepMe Developer Portal](https://docs.developer.sleep.me/docs/) to create your API token\n2. **Add Token Below**: Paste your API token in the API Keys field\n3. **Save & Restart**: Save configuration and restart Homebridge\n\n### Features\n\n- Control temperature and power state from Apple Home\n- Receive low water level alerts\n- Create HomeKit automations\n- Support for multiple devices\n\n---",
-  "footerDisplay": "### Need Help?\n\n- **Documentation**: [GitHub Repository](https://github.com/DaveLinger/homebridge-sleepme-dockpro)\n- **Issues**: [Report a Bug](https://github.com/DaveLinger/homebridge-sleepme-dockpro/issues)\n- **API Token**: [Create Token](https://docs.developer.sleep.me/docs/)\n\n### Tips\n\n- Use **battery** water level type for most users (shows water % in Home app)\n- Use **leak sensor** type if you want automations triggered by \"leak detected\"\n- Lower polling intervals = more responsive but higher API usage\n- Recommended: Keep default polling intervals unless experiencing rate limiting",
+  "headerDisplay": "### Getting Started\n\n1. **Create API Token**: Visit the [SleepMe Developer Portal](https://docs.developer.sleep.me/docs/) to create your API token\n2. **Add Token Below**: Paste your API token in the API Tokens field\n3. **Save & Restart**: Save configuration and restart Homebridge",
   "schema": {
     "type": "object",
     "required": ["name", "api_keys"],
@@ -16,7 +15,7 @@
         "placeholder": "Homebridge Sleepme Dock Pro"
       },
       "api_keys": {
-        "title": "API Keys",
+        "title": "API Tokens",
         "description": "SleepMe API tokens for authentication. Get your token at https://docs.developer.sleep.me/docs/",
         "type": "array",
         "items": {
@@ -69,14 +68,14 @@
         ],
         "description": "Choose how low water level alerts appear in HomeKit. Battery shows water %, leak/motion sensors are useful for automations."
       },
-      "active_polling_interval_seconds": {
-        "title": "Active Polling Interval (Seconds)",
+      "base_polling_interval_seconds": {
+        "title": "Base Polling Interval (Seconds)",
         "type": "number",
-        "default": 45,
+        "default": 10,
         "minimum": 10,
         "maximum": 300,
-        "placeholder": "45",
-        "description": "Leave this alone unless you have a reason to change it. The SleepMe API allows only 10 requests per minute per account, and the plugin already keeps itself under that automatically: this interval is raised as needed based on how many devices share your API token, so 10 seconds becomes 20 with two devices, 30 with three, and so on. A value above the safe floor is used as-is. Lower is more responsive but spends more of your quota."
+        "placeholder": "10",
+        "description": "Each device is polled every X seconds multiplied by the number of devices sharing your API token, so two docks at the default of 10 are each polled every 20 seconds. Total API usage stays the same however many docks you own. The SleepMe API allows only 10 requests per minute per account and the default spends exactly the share of that reserved for polling, so the only reason to change this is to use less: doubling it to 20 halves the plugin's API traffic."
       },
       "standby_polling_interval_minutes": {
         "title": "Standby Polling Interval (Minutes)",
@@ -90,17 +89,7 @@
     }
   },
   "layout": [
-    {
-      "type": "flex",
-      "flex-flow": "row wrap",
-      "items": [
-        {
-          "type": "flex",
-          "flex-flow": "column",
-          "items": ["name"]
-        }
-      ]
-    },
+    "name",
     {
       "key": "api_keys",
       "type": "array",
@@ -121,41 +110,49 @@
       "expanded": false,
       "items": [
         {
-          "type": "help",
-          "helpvalue": "<h5>Device Filtering</h5><p>By default every device on your account that reports the Dock Pro model (DP999NA) is added. Other SleepMe products do not report water level or water temperature, so they are skipped rather than added as thermostats that never update.</p>"
-        },
-        {
           "key": "device_ids",
           "type": "array",
           "title": "Device ID Allowlist",
           "buttonText": "Add Device ID",
-          "description": "🎯 Leave empty for all Dock Pros. Add IDs to restrict the plugin to specific devices."
+          "description": "Leave empty to add every Dock Pro on your account. Add IDs to restrict the plugin to specific devices.",
+          "items": [
+            {
+              "type": "string",
+              "placeholder": "zx-abcd1234efgh5678"
+            }
+          ]
         },
         {
           "key": "supported_models",
           "type": "array",
           "title": "Supported Models",
           "buttonText": "Add Model Code",
-          "description": "🏷️ Leave empty to use the default (DP999NA). Only change this if SleepMe ships a Dock Pro with a new model code."
+          "description": "Leave empty to use the default (DP999NA). Only change this if SleepMe ships a Dock Pro with a new model code.",
+          "items": [
+            {
+              "type": "string",
+              "placeholder": "DP999NA"
+            }
+          ]
         },
         {
           "key": "water_level_type",
           "title": "Water Level Alert Type",
-          "description": "💡 Tip: Use 'Battery' for most users. Use 'Leak Sensor' if you want HomeKit automations triggered by low water."
+          "description": "Use 'Battery' for most users. Use 'Leak Sensor' if you want HomeKit automations triggered by low water."
         },
         {
           "type": "help",
-          "helpvalue": "<h5>Polling Intervals</h5><p><strong>These are optimized automatically — most users should not change them.</strong></p><p>The SleepMe API allows 10 requests per minute per account. The plugin tracks its own request rate, holds budget in reserve so your taps in the Home app are never blocked by background polling, and raises the active interval to match how many devices share your token. Two docks set to 10 seconds are polled every 20 seconds; a value already above the safe floor is left alone.</p><p>Change these only if you want <em>slower</em> polling to leave more quota for something else.</p>"
+          "helpvalue": "<h5>Polling Intervals</h5><p>These are optimized automatically — most users should not change them.</p>"
         },
         {
-          "key": "active_polling_interval_seconds",
-          "title": "Active Mode Polling",
-          "description": "⚡ Check every X seconds when device is ON. Default: 45 seconds."
+          "key": "base_polling_interval_seconds",
+          "title": "Base Polling Interval (Seconds)",
+          "description": "Seconds between polls of each device while it is ON, multiplied by the number of devices sharing your API token. Two docks at the default are each polled every 20 seconds. Default: 10 seconds."
         },
         {
           "key": "standby_polling_interval_minutes",
-          "title": "Standby Mode Polling",
-          "description": "😴 Check every X minutes when device is OFF. Default: 15 minutes."
+          "title": "Standby Polling Interval (Minutes)",
+          "description": "Minutes between polls of each device while it is OFF. Not multiplied by device count. Default: 15 minutes."
         }
       ]
     }
