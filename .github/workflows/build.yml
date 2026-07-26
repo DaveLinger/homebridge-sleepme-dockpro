@@ -1,6 +1,17 @@
 name: Build and Lint
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  # Allows a run to be started by hand from the Actions tab, which is useful for
+  # confirming CI works without having to invent a commit.
+  workflow_dispatch:
+
+# Only the newest run per branch matters; cancel superseded ones rather than
+# letting a push burst queue up behind itself.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -15,15 +26,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js ${{ matrix.node-version }} 
+      - name: Use Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+          cache: npm
 
+      # `npm ci` installs strictly from the lockfile, so CI tests the dependency
+      # tree that will actually be published. `npm install` can silently resolve
+      # different versions and rewrite the lockfile.
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: run tests
+      - name: Run tests
         run: npm run test
 
       - name: Lint the project
@@ -32,10 +47,25 @@ jobs:
       - name: Build the project
         run: npm run build
 
-      - name: List, audit, fix outdated dependencies and build again
-        run: |
-          npm list --outdated
-          npm audit || true  # ignore failures
-          npm audit fix || true
-          npm list --outdated
-          npm run build
+  # Reported separately and allowed to fail: dependency advisories are not a
+  # reason to fail a build of unchanged source, and they should not gate a merge.
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Report outdated dependencies
+        run: npm outdated || true
+
+      - name: Report security advisories
+        run: npm audit || true
