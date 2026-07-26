@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Declared support for Node 24, which entered LTS in October 2025. Homebridge warned on startup that the plugin's `engines` range did not satisfy the running Node version. The range was stale rather than deliberately exclusive — no code change was needed — and 24.x is now covered by the CI matrix so the claim is tested.
+
 ## [1.3.0] - 2026-07-26
 
 ### Added
