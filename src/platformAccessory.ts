@@ -12,6 +12,18 @@ type SleepmeContext = {
 
 interface PlatformConfig {
   water_level_type?: 'battery' | 'leak' | 'motion';
+  /**
+   * Per-device share of the polling budget. Multiplied by the number of devices
+   * on the token to get the interval each device is actually polled at, so total
+   * API usage is the same whatever the account holds. See resolveActiveSeconds.
+   */
+  base_polling_interval_seconds?: number;
+  /**
+   * Deprecated predecessor of base_polling_interval_seconds, kept only so an
+   * existing install's polling rate does not change underneath it on upgrade. It
+   * meant the literal per-device interval, with the device scaling applied as a
+   * floor rather than a multiplier. Removed in the next major version.
+   */
   active_polling_interval_seconds?: number;
   standby_polling_interval_minutes?: number;
 }
@@ -62,13 +74,15 @@ class Option<T> {
 // Normalizes the unknown value from a catch block into a loggable string.
 const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-// Default polling intervals
-const DEFAULT_ACTIVE_POLLING_INTERVAL_SECONDS = 45;   // 45 seconds when device is active
-const DEFAULT_STANDBY_POLLING_INTERVAL_MINUTES = 15;  // 15 minutes when device is in standby
 // Smallest safe active interval for a SINGLE device: the account's polling budget
-// spread across a minute. With N devices on one token the floor becomes N times
-// this, which keeps total polling at POLL_BUDGET_PER_MINUTE regardless of count.
+// spread across a minute. Every device on a token multiplies it, which keeps total
+// polling at POLL_BUDGET_PER_MINUTE regardless of how many devices there are.
 const MIN_ACTIVE_SECONDS_PER_DEVICE = Math.ceil(60 / POLL_BUDGET_PER_MINUTE);
+// Defaulting to the per-device floor means the default spends the polling budget
+// exactly, and keeps doing so if the command reserve is ever retuned and the floor
+// moves with it.
+const DEFAULT_BASE_POLLING_INTERVAL_SECONDS = MIN_ACTIVE_SECONDS_PER_DEVICE;
+const DEFAULT_STANDBY_POLLING_INTERVAL_MINUTES = 15;  // 15 minutes when device is in standby
 // Standby polling is not scaled: at the 15 minute default even four devices cost
 // well under one request per minute, and stretching it would only delay noticing
 // a state change for no quota benefit.
@@ -87,6 +101,61 @@ const HIGH_TEMP_TARGET_F = 999;
 const LOW_TEMP_THRESHOLD_F = 55;
 const LOW_TEMP_TARGET_F = -1;
 
+type ActiveIntervalDecision = {
+  /** Seconds between polls of a single device. */
+  seconds: number;
+  /** Set when a deprecated setting was found; the caller logs it once at startup. */
+  deprecation?: string;
+};
+
+/**
+ * Works out how often to poll one device, and which of the two settings decided it.
+ *
+ * `base_polling_interval_seconds` is a per-device share of the account's polling
+ * budget, multiplied by the number of devices behind the token. Total usage is then
+ * 60 / base requests per minute whichever size the account is, so doubling the
+ * setting halves the traffic and nothing the user types is silently discarded.
+ *
+ * `active_polling_interval_seconds` meant the literal per-device interval and used
+ * the scaling as a floor: max(value, 10 x devices). That floor swallowed every
+ * value between 10 and the floor — with four docks, anything from 10 to 40 behaved
+ * identically — which is why it was replaced. It is still honoured exactly when
+ * present and alone, so upgrading cannot change an existing install's polling rate.
+ */
+function resolveActiveSeconds(config: PlatformConfig, deviceCount: number): ActiveIntervalDecision {
+  const legacy = config.active_polling_interval_seconds;
+  const base = config.base_polling_interval_seconds;
+
+  if (legacy !== undefined && base === undefined) {
+    const seconds = Math.max(legacy, MIN_ACTIVE_SECONDS_PER_DEVICE * deviceCount);
+    // The legacy interval is always at least MIN x deviceCount, so dividing it back
+    // out can never land under the new setting's own floor. It may not divide evenly.
+    const equivalent = Math.round(seconds / deviceCount);
+    const exact = equivalent * deviceCount === seconds;
+    return {
+      seconds,
+      deprecation:
+        '\'active_polling_interval_seconds\' is deprecated and will be removed in the next major version. ' +
+        `Your setting of ${legacy} is still being honoured — polling is unchanged at ${seconds}s per device — ` +
+        `but please replace it with 'base_polling_interval_seconds': ${equivalent}, which ` +
+        (exact
+          ? 'behaves identically.'
+          : `is the closest equivalent (${equivalent * deviceCount}s per device rather than ${seconds}s).`),
+    };
+  }
+
+  const decision = {
+    seconds: Math.max(base ?? DEFAULT_BASE_POLLING_INTERVAL_SECONDS, MIN_ACTIVE_SECONDS_PER_DEVICE) * deviceCount,
+  };
+
+  return legacy === undefined ? decision : {
+    ...decision,
+    deprecation:
+      'Ignoring deprecated \'active_polling_interval_seconds\' because \'base_polling_interval_seconds\' is also set. ' +
+      'Remove the deprecated setting to silence this warning.',
+  };
+}
+
 export class SleepmePlatformAccessory {
   private thermostatService: Service;
   private waterLevelService: Service;
@@ -95,6 +164,9 @@ export class SleepmePlatformAccessory {
   private readonly waterLevelType: 'battery' | 'leak' | 'motion';
   private readonly activePollingIntervalMs: number;
   private readonly standbyPollingIntervalMs: number;
+  // Delay before this device's first poll, offset from its siblings so their polls
+  // interleave rather than arriving together. See the constructor.
+  private readonly initialPollDelayMs: number;
   private expectedThermalState: 'standby' | 'active' | null = null; // Track expected state
   // Previous water readings, so transitions can be logged at info level (see publishUpdates)
   private previousWaterLevel: number | null = null;
@@ -123,6 +195,7 @@ export class SleepmePlatformAccessory {
     private readonly accessory: PlatformAccessory,
     initialStatus?: DeviceStatus,
     deviceCount = 1,
+    deviceIndex = 0,
   ) {
     const {Characteristic} = this.platform;
     const {apiKey, device} = this.accessory.context as SleepmeContext;
@@ -134,31 +207,31 @@ export class SleepmePlatformAccessory {
     const config = this.platform.config as PlatformConfig;
     this.waterLevelType = config.water_level_type || 'battery';
 
-    // Active polling scales with how many devices share this token's quota.
-    //
-    // The account gets POLL_BUDGET_PER_MINUTE polling requests per minute, so one
-    // device can safely poll every 60 / that budget seconds, and N devices need N
-    // times that. Taking the max with the configured value means the scaling only
-    // ever raises an interval that would breach the quota: two docks left at the
-    // 45s default stay at 45s rather than being stretched to 90s, while two docks
-    // set to the 10s floor land on 20s.
-    const minSafeActiveSeconds = MIN_ACTIVE_SECONDS_PER_DEVICE * deviceCount;
-    const requestedActiveSeconds = config.active_polling_interval_seconds ?? DEFAULT_ACTIVE_POLLING_INTERVAL_SECONDS;
-    const effectiveActiveSeconds = Math.max(requestedActiveSeconds, minSafeActiveSeconds);
-    this.activePollingIntervalMs = effectiveActiveSeconds * 1000;
+    // Active polling scales with how many devices share this token's quota, so the
+    // account stays inside POLL_BUDGET_PER_MINUTE however many docks it holds.
+    const activeInterval = resolveActiveSeconds(config, deviceCount);
+    this.activePollingIntervalMs = activeInterval.seconds * 1000;
 
-    if (effectiveActiveSeconds > requestedActiveSeconds) {
-      this.platform.log.info(
-        `${this.accessory.displayName}: Active polling interval raised from ${requestedActiveSeconds}s to ` +
-        `${effectiveActiveSeconds}s because ${deviceCount} devices share this account's quota of ` +
-        `${REQUESTS_PER_MINUTE} requests per minute.`,
-      );
-    } else {
-      this.platform.log.debug(
-        `${this.accessory.displayName}: Active polling interval ${effectiveActiveSeconds}s ` +
-        `(safe floor for ${deviceCount} device(s) is ${minSafeActiveSeconds}s)`,
-      );
+    if (activeInterval.deprecation) {
+      this.platform.log.warn(`${this.accessory.displayName}: ${activeInterval.deprecation}`);
     }
+
+    // Every accessory is constructed in the same synchronous loop, so without an
+    // offset their timers all fire together: N requests at once, then a quiet
+    // stretch, repeating. The minute total is the same either way, but a burst
+    // leaves no budget spare for the post-command status read, which then gets
+    // deferred to the next window. Spreading the first poll across one interval
+    // puts a gap between each device instead, so one request goes out every
+    // interval / deviceCount seconds. A command reschedules its own device and
+    // shifts that device's phase, which is a one-off drift, not worth correcting.
+    this.initialPollDelayMs = this.activePollingIntervalMs
+      + Math.round(deviceIndex * (this.activePollingIntervalMs / deviceCount));
+
+    this.platform.log.debug(
+      `${this.accessory.displayName}: Active polling every ${activeInterval.seconds}s, first poll in ` +
+      `${this.initialPollDelayMs / 1000}s (device ${deviceIndex + 1} of ${deviceCount} sharing this ` +
+      `account's quota of ${REQUESTS_PER_MINUTE} requests per minute)`,
+    );
 
     // Set up standby polling interval from config or use default
     const configuredStandbyMinutes = config.standby_polling_interval_minutes;
@@ -250,14 +323,17 @@ export class SleepmePlatformAccessory {
         });
     }
 
-    // Set up polling based on initial unknown state
-    // We'll use the active polling rate initially until we know the device state
+    // Set up polling based on initial unknown state. The active rate is used until
+    // the device's state is known, offset by this device's stagger so the first
+    // round of polls interleaves rather than arriving as one burst. HomeKit is not
+    // waiting on it either way: the status fetched during discovery is already
+    // applied above, and every onGet answers from that cache without an API call.
     this.scheduleNextCheck(async () => {
       this.platform.log.debug(`Polling device status for ${this.accessory.displayName}`)
       const r = await client.getDeviceStatus(device.id);
       this.platform.log.debug(`Response (${this.accessory.displayName}): ${r.status}`)
       return r.data
-    });
+    }, this.initialPollDelayMs);
 
     // Log metrics summary every hour for monitoring (debug level)
     this.metricsInterval = setInterval(() => {
@@ -723,9 +799,10 @@ export class SleepmePlatformAccessory {
     });
   }
 
-  private scheduleNextCheck(poller: () => Promise<DeviceStatus>) {
-    // Get the appropriate polling interval based on current state
-    const pollingInterval = this.getPollingIntervalBasedOnState();
+  // delayMsOverride is used only for the very first poll, to apply this device's
+  // stagger offset. Every reschedule after that uses the state-based interval.
+  private scheduleNextCheck(poller: () => Promise<DeviceStatus>, delayMsOverride?: number) {
+    const pollingInterval = delayMsOverride ?? this.getPollingIntervalBasedOnState();
 
     this.platform.log.debug(`${this.accessory.displayName}: Scheduling next poll in ${pollingInterval/1000}s`);
 
