@@ -1,13 +1,5 @@
 name: release
-on:
-  workflow_dispatch:
-    inputs:
-      increment:
-        description: 'Version increment to release'
-        type: choice
-        required: true
-        default: patch
-        options: [patch, minor, major]
+on: workflow_dispatch
 jobs:
   release:
     permissions:
@@ -41,9 +33,7 @@ jobs:
       - name: Lint the project
         run: npm run lint
 
-      # release-it defaults to a patch bump when given no increment, so the level
-      # has to be passed explicitly or a minor release silently ships as a patch.
-      - run: npx release-it ${{ inputs.increment }}
+      - run: npx release-it
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
