@@ -1,9 +1,26 @@
 name: release
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      increment:
+        description: 'Version increment to release'
+        type: choice
+        required: true
+        default: patch
+        options: [patch, minor, major]
+      dry_run:
+        description: 'Rehearse without tagging, pushing, or publishing'
+        type: boolean
+        default: false
 jobs:
   release:
     permissions:
       contents: write
+      # Lets the runner mint the OIDC token npm exchanges for short-lived publish
+      # credentials. This is what replaces a stored NPM_TOKEN; the trust is
+      # registered on npmjs.com against this repository and this workflow file,
+      # so renaming the file breaks publishing until it is updated there.
+      id-token: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,13 +32,17 @@ jobs:
           git config user.name "${GITHUB_ACTOR}"
           git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
 
-      # registry-url writes the .npmrc that `npm publish` needs. Without it the
-      # NPM_TOKEN env var alone does not authenticate npm, so publishing fails.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: npm
           registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or newer, and which npm ships with a
+      # given Node release moves around, so pin the floor here rather than
+      # inherit whatever the runner happens to have.
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
 
       - name: Install dependencies
         run: npm ci
@@ -33,8 +54,10 @@ jobs:
       - name: Lint the project
         run: npm run lint
 
-      - run: npx release-it
+      # release-it defaults to a patch bump when given no increment, so the level
+      # has to be passed explicitly or a minor release silently ships as a patch.
+      # There is no NPM_TOKEN: npm authenticates over OIDC. GITHUB_TOKEN is the
+      # automatic per-run token, used only to create the GitHub release.
+      - run: npx release-it ${{ inputs.increment }} ${{ inputs.dry_run && '--dry-run' || '' }}
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
