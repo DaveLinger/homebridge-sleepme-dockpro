@@ -2,7 +2,7 @@
 import {CharacteristicValue, PlatformAccessory, Service} from 'homebridge';
 
 import {SleepmePlatform} from './platform.js';
-import {Client, Control, Device, DeviceStatus} from './sleepme/client.js';
+import {Client, Device, DeviceStatus, SleepmeApiError} from './sleepme/client.js';
 
 type SleepmeContext = {
   device: Device;
@@ -26,10 +26,10 @@ function newMapper(platform: SleepmePlatform): Mapper {
       if (status.control.thermal_control_status === 'standby') {
         return Characteristic.CurrentHeatingCoolingState.OFF;
       }
-      
+
       const currentTemp = status.status.water_temperature_c;
       const targetTemp = status.control.set_temperature_c;
-      
+
       if (targetTemp > currentTemp) {
         return Characteristic.CurrentHeatingCoolingState.HEAT;
       } else {
@@ -58,14 +58,18 @@ class Option<T> {
   }
 }
 
+// Normalizes the unknown value from a catch block into a loggable string.
+const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
 // Default polling intervals
 const DEFAULT_ACTIVE_POLLING_INTERVAL_SECONDS = 45;   // 45 seconds when device is active
 const DEFAULT_STANDBY_POLLING_INTERVAL_MINUTES = 15;  // 15 minutes when device is in standby
+// Floors must stay in sync with the `minimum` values in config.schema.json
+const MIN_ACTIVE_POLLING_INTERVAL_SECONDS = 10;
+const MIN_STANDBY_POLLING_INTERVAL_MINUTES = 1;
 const INITIAL_RETRY_DELAY_MS = 15000;                 // 15 seconds for first retry
 const MAX_RETRY_DELAY_MS = 60000;                     // Cap retry delay at 60 seconds
 const MAX_RETRIES = 3;                                // Maximum number of retry attempts
-const STATE_MISMATCH_RETRY_DELAY_MS = 5000;           // 5 seconds between state mismatch retries
-const MAX_STATE_MISMATCH_RETRIES = 3;                 // Maximum retries for state mismatches
 const HIGH_TEMP_THRESHOLD_F = 115;
 const HIGH_TEMP_TARGET_F = 999;
 const LOW_TEMP_THRESHOLD_F = 55;
@@ -79,9 +83,11 @@ export class SleepmePlatformAccessory {
   private readonly waterLevelType: 'battery' | 'leak' | 'motion';
   private readonly activePollingIntervalMs: number;
   private readonly standbyPollingIntervalMs: number;
-  private previousHeatingCoolingState: number | null = null;
   private expectedThermalState: 'standby' | 'active' | null = null; // Track expected state
-  
+  // Previous water readings, so transitions can be logged at info level (see publishUpdates)
+  private previousWaterLevel: number | null = null;
+  private previousIsWaterLow: boolean | null = null;
+
   // Metrics tracking
   private metrics = {
     apiCalls: {
@@ -98,8 +104,9 @@ export class SleepmePlatformAccessory {
   constructor(
     private readonly platform: SleepmePlatform,
     private readonly accessory: PlatformAccessory,
+    initialStatus?: DeviceStatus,
   ) {
-    const {Characteristic, Service} = this.platform;
+    const {Characteristic} = this.platform;
     const {apiKey, device} = this.accessory.context as SleepmeContext;
     const client = new Client(apiKey, undefined, this.platform.log);
     this.deviceStatus = null;
@@ -107,13 +114,16 @@ export class SleepmePlatformAccessory {
     // Get configuration
     const config = this.platform.config as PlatformConfig;
     this.waterLevelType = config.water_level_type || 'battery';
-    
+
     // Set up active polling interval from config or use default
     const configuredActiveSeconds = config.active_polling_interval_seconds;
     if (configuredActiveSeconds !== undefined) {
-      if (configuredActiveSeconds < 5) {
-        this.platform.log.warn(`Active polling interval must be at least 5 seconds. Using 5 seconds.`);
-        this.activePollingIntervalMs = 5 * 1000;
+      if (configuredActiveSeconds < MIN_ACTIVE_POLLING_INTERVAL_SECONDS) {
+        this.platform.log.warn(
+          `Active polling interval must be at least ${MIN_ACTIVE_POLLING_INTERVAL_SECONDS} seconds. ` +
+          `Using ${MIN_ACTIVE_POLLING_INTERVAL_SECONDS} seconds.`,
+        );
+        this.activePollingIntervalMs = MIN_ACTIVE_POLLING_INTERVAL_SECONDS * 1000;
       } else {
         this.activePollingIntervalMs = configuredActiveSeconds * 1000;
         this.platform.log.debug(`Using configured active polling interval of ${configuredActiveSeconds} seconds`);
@@ -126,9 +136,12 @@ export class SleepmePlatformAccessory {
     // Set up standby polling interval from config or use default
     const configuredStandbyMinutes = config.standby_polling_interval_minutes;
     if (configuredStandbyMinutes !== undefined) {
-      if (configuredStandbyMinutes < 1) {
-        this.platform.log.warn(`Standby polling interval must be at least 1 minute. Using 1 minute.`);
-        this.standbyPollingIntervalMs = 60 * 1000;
+      if (configuredStandbyMinutes < MIN_STANDBY_POLLING_INTERVAL_MINUTES) {
+        this.platform.log.warn(
+          `Standby polling interval must be at least ${MIN_STANDBY_POLLING_INTERVAL_MINUTES} minute(s). ` +
+          `Using ${MIN_STANDBY_POLLING_INTERVAL_MINUTES} minute(s).`,
+        );
+        this.standbyPollingIntervalMs = MIN_STANDBY_POLLING_INTERVAL_MINUTES * 60 * 1000;
       } else {
         this.standbyPollingIntervalMs = configuredStandbyMinutes * 60 * 1000;
         this.platform.log.debug(`Using configured standby polling interval of ${configuredStandbyMinutes} minutes`);
@@ -149,57 +162,36 @@ export class SleepmePlatformAccessory {
     this.thermostatService = this.accessory.getService(this.platform.Service.Thermostat) ||
       this.accessory.addService(this.platform.Service.Thermostat, `${this.accessory.displayName} - Dock Pro`);
 
-    // Remove any existing water level services first
-    const existingBatteryService = this.accessory.getService(this.platform.Service.Battery);
-    const existingLeakService = this.accessory.getService(this.platform.Service.LeakSensor);
-    const existingMotionService = this.accessory.getService(this.platform.Service.MotionSensor);
-    const existingHighModeService = this.accessory.getService('High Mode');
-    const existingBoostService = this.accessory.getService('Temperature Boost');
-    
-    // Debug existing services
-    this.platform.log.debug(`Existing services before removal:
-      Battery: ${!!existingBatteryService}
-      Leak: ${!!existingLeakService}
-      Motion: ${!!existingMotionService}`);
-    
-    if (existingBatteryService) {
-      this.platform.log.debug('Removing existing battery service');
-      this.accessory.removeService(existingBatteryService);
-    }
-    if (existingLeakService) {
-      this.platform.log.debug('Removing existing leak service');
-      this.accessory.removeService(existingLeakService);
-    }
-    if (existingMotionService) {
-      this.platform.log.debug('Removing existing motion service');
-      this.accessory.removeService(existingMotionService);
-    }
-    if (existingHighModeService) {
-      this.platform.log.debug('Removing existing high mode service');
-      this.accessory.removeService(existingHighModeService);
-    }
-    if (existingBoostService) {
-      this.platform.log.debug('Removing existing temperature boost service');
-      this.accessory.removeService(existingBoostService);
-    }
+    // Reuse the water level service matching the configured type, and drop only the
+    // services left behind by a *previous* configuration. Removing and re-adding the
+    // service on every launch would republish the accessory's service list each restart.
+    const waterLevelServices = {
+      battery: this.platform.Service.Battery,
+      leak: this.platform.Service.LeakSensor,
+      motion: this.platform.Service.MotionSensor,
+    };
+    const waterLevelServiceName = `${this.accessory.displayName} - Water Level`;
 
-    // Add the appropriate water level service based on configuration
-    this.platform.log.debug(`Creating new water level service of type: ${this.waterLevelType}`);
-    if (this.waterLevelType === 'leak') {
-      this.waterLevelService = this.accessory.addService(
-        this.platform.Service.LeakSensor,
-        `${this.accessory.displayName} - Water Level`
-      );
-    } else if (this.waterLevelType === 'motion') {
-      this.waterLevelService = this.accessory.addService(
-        this.platform.Service.MotionSensor,
-        `${this.accessory.displayName} - Water Level`
-      );
+    Object.entries(waterLevelServices).forEach(([type, serviceType]) => {
+      if (type === this.waterLevelType) {
+        return;
+      }
+      const staleService = this.accessory.getService(serviceType);
+      if (staleService) {
+        this.platform.log.debug(`Removing ${type} water level service from a previous configuration`);
+        this.accessory.removeService(staleService);
+      }
+    });
+
+    const configuredService = waterLevelServices[this.waterLevelType];
+    const existingWaterLevelService = this.accessory.getService(configuredService);
+    if (existingWaterLevelService) {
+      this.platform.log.debug(`Reusing existing ${this.waterLevelType} water level service`);
+      this.waterLevelService = existingWaterLevelService;
+      this.waterLevelService.setCharacteristic(Characteristic.Name, waterLevelServiceName);
     } else {
-      this.waterLevelService = this.accessory.addService(
-        this.platform.Service.Battery,
-        `${this.accessory.displayName} - Water Level`
-      );
+      this.platform.log.debug(`Creating new water level service of type: ${this.waterLevelType}`);
+      this.waterLevelService = this.accessory.addService(configuredService, waterLevelServiceName);
     }
 
     // Set accessory information
@@ -211,21 +203,20 @@ export class SleepmePlatformAccessory {
     // Initialize all characteristic handlers after services are created
     this.initializeCharacteristics(client, device);
 
-    // Get initial device status
-    client.getDeviceStatus(device.id)
-      .then(statusResponse => {
-        this.deviceStatus = statusResponse.data;
-        
-        // Update firmware version in accessory info now that we have device status
-        this.accessory.getService(this.platform.Service.AccessoryInformation)!
-          .setCharacteristic(Characteristic.FirmwareRevision, this.deviceStatus.about.firmware_version);
-        
-        this.publishUpdates();
-      })
-      .catch(error => {
-        this.platform.log.error(`Failed to get initial device status for ${this.accessory.displayName}: ${error instanceof Error ? error.message : String(error)}`);
-        // Still continue with setup, we'll retry on the next polling cycle
-      });
+    // Apply the status the platform already fetched during discovery, if it passed one
+    // in; otherwise fetch it now. Reusing it keeps startup to one status call per device.
+    if (initialStatus) {
+      this.applyDeviceStatus(initialStatus);
+    } else {
+      client.getDeviceStatus(device.id)
+        .then(statusResponse => this.applyDeviceStatus(statusResponse.data))
+        .catch(error => {
+          this.platform.log.error(
+            `Failed to get initial device status for ${this.accessory.displayName}: ${errorMessage(error)}`,
+          );
+          // Still continue with setup, we'll retry on the next polling cycle
+        });
+    }
 
     // Set up polling based on initial unknown state
     // We'll use the active polling rate initially until we know the device state
@@ -235,7 +226,7 @@ export class SleepmePlatformAccessory {
       this.platform.log.debug(`Response (${this.accessory.displayName}): ${r.status}`)
       return r.data
     });
-    
+
     // Log metrics summary every hour for monitoring (debug level)
     setInterval(() => {
       if (this.metrics.apiCalls.successful > 0 || this.metrics.apiCalls.failed > 0) {
@@ -244,13 +235,24 @@ export class SleepmePlatformAccessory {
     }, 60 * 60 * 1000); // Every hour
   }
 
+  // Adopts a fresh device status: stores it, refreshes the reported firmware
+  // version, and pushes every characteristic to HomeKit.
+  private applyDeviceStatus(status: DeviceStatus): void {
+    this.deviceStatus = status;
+
+    this.accessory.getService(this.platform.Service.AccessoryInformation)!
+      .setCharacteristic(this.platform.Characteristic.FirmwareRevision, status.about.firmware_version);
+
+    this.publishUpdates();
+  }
+
   // Update the retry helper method in the SleepmePlatformAccessory class
   private retryApiCall<T>(
-    operation: () => Promise<T>, 
-    deviceName: string, 
-    operationName: string, 
-    maxRetries: number = MAX_RETRIES, 
-    currentAttempt: number = 1
+    operation: () => Promise<T>,
+    deviceName: string,
+    operationName: string,
+    maxRetries: number = MAX_RETRIES,
+    currentAttempt: number = 1,
   ): Promise<T> {
     return operation().then(result => {
       // Track successful API call
@@ -260,90 +262,55 @@ export class SleepmePlatformAccessory {
       return result;
     }).catch(error => {
       // Track failed API call
-      const statusCode = (error as any).statusCode;
-      
+      const statusCode = error instanceof SleepmeApiError ? error.statusCode : undefined;
+      const errorCode = error instanceof SleepmeApiError ? error.code : undefined;
+
       if (statusCode === 429) {
         this.metrics.apiCalls.rateLimited++;
-      } else if ((error as any).code === 'ECONNABORTED') {
+      } else if (errorCode === 'ECONNABORTED') {
         this.metrics.apiCalls.timeout++;
       }
-      
+
       // Retry on any error, not just rate limits
       if (currentAttempt <= maxRetries) {
         // Calculate exponential backoff delay with cap: 15s, 30s, 60s (capped)
         const uncappedDelay = INITIAL_RETRY_DELAY_MS * Math.pow(2, currentAttempt - 1);
         const delay = Math.min(uncappedDelay, MAX_RETRY_DELAY_MS);
-        
+
         // Format error message based on status code if available
-        let errorDetails = error instanceof Error ? error.message : String(error);
+        let errorDetails = errorMessage(error);
         if (statusCode) {
           errorDetails = `HTTP ${statusCode}: ${errorDetails}`;
         }
-        
+
         this.platform.log.warn(
-          `${deviceName}: Failed to ${operationName} (${errorDetails}). Retrying in ${delay/1000}s (attempt ${currentAttempt}/${maxRetries})`
+          `${deviceName}: Failed to ${operationName} (${errorDetails}). ` +
+          `Retrying in ${delay/1000}s (attempt ${currentAttempt}/${maxRetries})`,
         );
-        
+
         // Wait and then retry with exponential backoff
         return new Promise(resolve => setTimeout(resolve, delay))
           .then(() => this.retryApiCall(
-            operation, 
+            operation,
             deviceName,
             operationName,
             maxRetries,
-            currentAttempt + 1
+            currentAttempt + 1,
           ));
       }
-      
+
       // If we've exhausted retries, track the failure and rethrow
       this.metrics.apiCalls.failed++;
       this.metrics.consecutiveFailures++;
       this.metrics.lastFailedPoll = new Date();
-      
+
       // Log metrics summary if we have multiple consecutive failures (warn level to alert user)
       if (this.metrics.consecutiveFailures >= 3) {
         this.logMetricsSummary('warn');
       }
-      
+
       throw error;
     });
-  }
-
-  // Helper method to handle thermal state mismatches
-  private handleStateMismatch(
-    client: Client, 
-    device: Device, 
-    expectedState: 'standby' | 'active', 
-    actualState: 'standby' | 'active',
-    retryCount: number = 0
-  ): Promise<Control> {
-    if (retryCount >= MAX_STATE_MISMATCH_RETRIES) {
-      this.platform.log.warn(`${this.accessory.displayName}: State mismatch persisted after ${MAX_STATE_MISMATCH_RETRIES} retries. API returned ${actualState}, expected ${expectedState}. Accepting API state.`);
-      // Reset the expected state since we're accepting the API state
-      this.expectedThermalState = null;
-      // Return the control with the actual state
-      return Promise.resolve({ 
-        ...this.deviceStatus!.control,
-        thermal_control_status: actualState
-      } as Control);
-    }
-
-    this.platform.log.warn(`${this.accessory.displayName}: State mismatch detected! API returned ${actualState}, expected ${expectedState}. Retrying (${retryCount + 1}/${MAX_STATE_MISMATCH_RETRIES})`);
-
-    // Wait and retry setting the state
-    return new Promise(resolve => setTimeout(resolve, STATE_MISMATCH_RETRY_DELAY_MS))
-      .then(() => client.setThermalControlStatus(device.id, expectedState))
-      .then(r => {
-        const responseState = r.data.thermal_control_status;
-        if (responseState === expectedState) {
-          this.platform.log.info(`${this.accessory.displayName}: Successfully set state to ${expectedState} after retry`);
-          this.expectedThermalState = null; // Reset expected state now that it matches
-          return r.data;
-        } else {
-          // Still mismatched, retry again
-          return this.handleStateMismatch(client, device, expectedState, responseState, retryCount + 1);
-        }
-      });
   }
 
   // Helper method to clamp temperature values to valid range for HomeKit
@@ -359,8 +326,8 @@ export class SleepmePlatformAccessory {
   private logMetricsSummary(level: 'info' | 'warn' | 'debug' = 'info'): void {
     const total = this.metrics.apiCalls.successful + this.metrics.apiCalls.failed;
     const successRate = total > 0 ? ((this.metrics.apiCalls.successful / total) * 100).toFixed(1) : '0.0';
-    
-    const message = 
+
+    const message =
       `${this.accessory.displayName} API Metrics: ` +
       `Success: ${this.metrics.apiCalls.successful}, ` +
       `Failed: ${this.metrics.apiCalls.failed}, ` +
@@ -369,7 +336,7 @@ export class SleepmePlatformAccessory {
       `Success Rate: ${successRate}%, ` +
       `Consecutive Failures: ${this.metrics.consecutiveFailures}, ` +
       `Last Success: ${this.metrics.lastSuccessfulPoll?.toLocaleString() || 'Never'}`;
-    
+
     if (level === 'warn') {
       this.platform.log.warn(message);
     } else if (level === 'debug') {
@@ -386,8 +353,8 @@ export class SleepmePlatformAccessory {
     if (this.waterLevelType === 'leak') {
       this.waterLevelService.getCharacteristic(Characteristic.LeakDetected)
         .onGet(() => new Option(this.deviceStatus)
-          .map(ds => ds.status.is_water_low ? 
-            Characteristic.LeakDetected.LEAK_DETECTED : 
+          .map(ds => ds.status.is_water_low ?
+            Characteristic.LeakDetected.LEAK_DETECTED :
             Characteristic.LeakDetected.LEAK_NOT_DETECTED)
           .orElse(Characteristic.LeakDetected.LEAK_NOT_DETECTED));
     } else if (this.waterLevelType === 'motion') {
@@ -398,8 +365,8 @@ export class SleepmePlatformAccessory {
     } else {
       this.waterLevelService.getCharacteristic(Characteristic.StatusLowBattery)
         .onGet(() => new Option(this.deviceStatus)
-          .map(ds => ds.status.is_water_low ? 
-            Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW : 
+          .map(ds => ds.status.is_water_low ?
+            Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW :
             Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL)
           .orElse(Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL));
 
@@ -425,8 +392,8 @@ export class SleepmePlatformAccessory {
         ],
       })
       .onGet(() => new Option(this.deviceStatus)
-        .map(ds => ds.control.thermal_control_status === 'standby' ? 
-          Characteristic.TargetHeatingCoolingState.OFF : 
+        .map(ds => ds.control.thermal_control_status === 'standby' ?
+          Characteristic.TargetHeatingCoolingState.OFF :
           Characteristic.TargetHeatingCoolingState.AUTO)
         .orElse(Characteristic.TargetHeatingCoolingState.OFF))
       .onSet(async (value: CharacteristicValue) => {
@@ -457,13 +424,15 @@ export class SleepmePlatformAccessory {
         this.retryApiCall(
           () => client.setThermalControlStatus(device.id, targetState),
           this.accessory.displayName,
-          'set thermal control status'
+          'set thermal control status',
         )
           .then(() => {
             this.expectedThermalState = null;
           })
           .catch(error => {
-            this.platform.log.error(`${this.accessory.displayName}: Failed to set thermal control state after retries: ${error instanceof Error ? error.message : String(error)}`);
+            this.platform.log.error(
+              `${this.accessory.displayName}: Failed to set thermal control state after retries: ${errorMessage(error)}`,
+            );
             return client.getDeviceStatus(device.id)
               .then(statusResponse => {
                 this.deviceStatus = statusResponse.data;
@@ -472,7 +441,9 @@ export class SleepmePlatformAccessory {
                 this.scheduleNextPollBasedOnState();
               })
               .catch(refreshError => {
-                this.platform.log.error(`${this.accessory.displayName}: Failed to refresh status after error: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
+                this.platform.log.error(
+                  `${this.accessory.displayName}: Failed to refresh status after error: ${errorMessage(refreshError)}`,
+                );
               });
           });
       });
@@ -486,7 +457,7 @@ export class SleepmePlatformAccessory {
       .setProps({
         minValue: 12,
         maxValue: 46.7,
-        minStep: 0.5
+        minStep: 0.5,
       })
       .onGet(() => new Option(this.deviceStatus)
         .map(ds => {
@@ -502,15 +473,21 @@ export class SleepmePlatformAccessory {
         .orElse(21))
       .onSet(async (value: CharacteristicValue) => {
         const tempC = value as number;
-        let tempF = Math.round((tempC * (9 / 5)) + 32);
+        const tempF = Math.round((tempC * (9 / 5)) + 32);
 
         // Map to special API values for extremes
         let apiTemp = tempF;
         if (tempF > HIGH_TEMP_THRESHOLD_F) {
-          this.platform.log(`${this.accessory.displayName}: Temperature over ${HIGH_TEMP_THRESHOLD_F}F, mapping to ${HIGH_TEMP_TARGET_F}F for API call`);
+          this.platform.log(
+            `${this.accessory.displayName}: Temperature over ${HIGH_TEMP_THRESHOLD_F}F, ` +
+            `mapping to ${HIGH_TEMP_TARGET_F}F for API call`,
+          );
           apiTemp = HIGH_TEMP_TARGET_F;
         } else if (tempF < LOW_TEMP_THRESHOLD_F) {
-          this.platform.log(`${this.accessory.displayName}: Temperature under ${LOW_TEMP_THRESHOLD_F}F, mapping to ${LOW_TEMP_TARGET_F}F for API call`);
+          this.platform.log(
+            `${this.accessory.displayName}: Temperature under ${LOW_TEMP_THRESHOLD_F}F, ` +
+            `mapping to ${LOW_TEMP_TARGET_F}F for API call`,
+          );
           apiTemp = LOW_TEMP_TARGET_F;
         } else {
           this.platform.log(`${this.accessory.displayName}: Setting temperature to: ${tempC}°C (${tempF}°F)`);
@@ -528,10 +505,10 @@ export class SleepmePlatformAccessory {
         this.retryApiCall(
           () => client.setTemperatureFahrenheit(device.id, apiTemp),
           this.accessory.displayName,
-          'set temperature'
+          'set temperature',
         )
           .catch(error => {
-            this.platform.log.error(`${this.accessory.displayName}: Failed to set temperature after retries: ${error instanceof Error ? error.message : String(error)}`);
+            this.platform.log.error(`${this.accessory.displayName}: Failed to set temperature after retries: ${errorMessage(error)}`);
             // Revert optimistic update by fetching actual device state
             return client.getDeviceStatus(device.id)
               .then(statusResponse => {
@@ -539,7 +516,9 @@ export class SleepmePlatformAccessory {
                 this.publishUpdates();
               })
               .catch(refreshError => {
-                this.platform.log.error(`${this.accessory.displayName}: Failed to refresh status after error: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
+                this.platform.log.error(
+                  `${this.accessory.displayName}: Failed to refresh status after error: ${errorMessage(refreshError)}`,
+                );
               });
           });
       });
@@ -561,7 +540,7 @@ export class SleepmePlatformAccessory {
         }
         client.setDisplayTemperatureUnit(device.id, unit)
           .catch(error => {
-            this.platform.log.error(`${this.accessory.displayName}: Failed to set display temperature unit: ${error instanceof Error ? error.message : String(error)}`);
+            this.platform.log.error(`${this.accessory.displayName}: Failed to set display temperature unit: ${errorMessage(error)}`);
           });
       });
   }
@@ -573,11 +552,14 @@ export class SleepmePlatformAccessory {
       this.platform.log.debug(`${this.accessory.displayName}: No device status yet, using active polling interval`);
       return this.activePollingIntervalMs;
     }
-    
+
     const isActive = this.deviceStatus.control.thermal_control_status === 'active';
     const interval = isActive ? this.activePollingIntervalMs : this.standbyPollingIntervalMs;
-    
-    this.platform.log.debug(`${this.accessory.displayName}: Device is ${isActive ? 'ACTIVE' : 'STANDBY'}, using ${interval/1000} second polling interval`);
+
+    this.platform.log.debug(
+      `${this.accessory.displayName}: Device is ${isActive ? 'ACTIVE' : 'STANDBY'}, ` +
+      `using ${interval/1000} second polling interval`,
+    );
     return interval;
   }
 
@@ -588,12 +570,14 @@ export class SleepmePlatformAccessory {
       clearTimeout(this.timeout);
       this.timeout = undefined;
     }
-    
+
     // Get the appropriate polling interval based on state
     const pollingInterval = this.getPollingIntervalBasedOnState();
-    
-    this.platform.log.debug(`${this.accessory.displayName}: Rescheduling polling with ${pollingInterval/1000}s interval based on current state`);
-    
+
+    this.platform.log.debug(
+      `${this.accessory.displayName}: Rescheduling polling with ${pollingInterval/1000}s interval based on current state`,
+    );
+
     // Schedule the next poll with the new interval
     this.scheduleNextCheck(async () => {
       const {apiKey, device} = this.accessory.context as SleepmeContext;
@@ -608,130 +592,111 @@ export class SleepmePlatformAccessory {
   private scheduleNextCheck(poller: () => Promise<DeviceStatus>) {
     // Get the appropriate polling interval based on current state
     const pollingInterval = this.getPollingIntervalBasedOnState();
-    
+
     this.platform.log.debug(`${this.accessory.displayName}: Scheduling next poll in ${pollingInterval/1000}s`);
-    
+
     clearTimeout(this.timeout);
     this.timeout = setTimeout(() => {
       this.platform.log.debug(`${this.accessory.displayName}: Polling at: ${new Date()}`);
-      
+
       // Use the retry mechanism for polling as well
       const getStatusOperation = () => poller();
-      
+
       this.retryApiCall(
         getStatusOperation,
         this.accessory.displayName,
-        "poll device status"
+        'poll device status',
       )
-      .then(s => {
-        const previousState = this.deviceStatus?.control.thermal_control_status;
-        const previousFirmware = this.deviceStatus?.about.firmware_version;
-        this.deviceStatus = s;
-        
-        // Update firmware version if it changed
-        if (previousFirmware && s.about.firmware_version !== previousFirmware) {
-          this.platform.log.info(`${this.accessory.displayName}: Firmware updated from ${previousFirmware} to ${s.about.firmware_version}`);
+        .then(s => {
+          const previousState = this.deviceStatus?.control.thermal_control_status;
+          const previousFirmware = this.deviceStatus?.about.firmware_version;
+          this.deviceStatus = s;
+
+          // Update firmware version if it changed
+          if (previousFirmware && s.about.firmware_version !== previousFirmware) {
+            this.platform.log.info(
+              `${this.accessory.displayName}: Firmware updated from ${previousFirmware} to ${s.about.firmware_version}`,
+            );
           this.accessory.getService(this.platform.Service.AccessoryInformation)!
             .setCharacteristic(this.platform.Characteristic.FirmwareRevision, s.about.firmware_version);
-        }
-        
-        // Check if we're waiting for a specific thermal state
-        if (this.expectedThermalState !== null && s.control.thermal_control_status !== this.expectedThermalState) {
-          this.platform.log.warn(`${this.accessory.displayName}: Device state (${s.control.thermal_control_status}) does not match expected state (${this.expectedThermalState}) during polling`);
-          // Don't update HomeKit with the mismatched state - we'll keep the optimistic state
-          // But do update everything else
-          const savedState = this.expectedThermalState;
-          if (this.deviceStatus) {
-            this.deviceStatus.control.thermal_control_status = savedState;
           }
-        } else if (this.expectedThermalState !== null && s.control.thermal_control_status === this.expectedThermalState) {
+
+          // Check if we're waiting for a specific thermal state
+          if (this.expectedThermalState !== null && s.control.thermal_control_status !== this.expectedThermalState) {
+            this.platform.log.warn(
+              `${this.accessory.displayName}: Device state (${s.control.thermal_control_status}) ` +
+            `does not match expected state (${this.expectedThermalState}) during polling`,
+            );
+            // Don't update HomeKit with the mismatched state - we'll keep the optimistic state
+            // But do update everything else
+            const savedState = this.expectedThermalState;
+            if (this.deviceStatus) {
+              this.deviceStatus.control.thermal_control_status = savedState;
+            }
+          } else if (this.expectedThermalState !== null && s.control.thermal_control_status === this.expectedThermalState) {
           // State now matches what we expected - we can clear the expected state flag
-          this.platform.log.info(`${this.accessory.displayName}: Device state now matches expected state (${this.expectedThermalState})`);
-          this.expectedThermalState = null;
-        }
-        
-        // Check if device state has changed, which would affect polling interval
-        const currentState = this.deviceStatus.control.thermal_control_status;
-        if (previousState !== currentState) {
-          this.platform.log.info(`${this.accessory.displayName}: Device state changed from ${previousState || 'unknown'} to ${currentState}, adjusting polling interval`);
-          // Update UI first
+            this.platform.log.info(`${this.accessory.displayName}: Device state now matches expected state (${this.expectedThermalState})`);
+            this.expectedThermalState = null;
+          }
+
+          // Check if device state has changed, which would affect polling interval
+          const currentState = this.deviceStatus.control.thermal_control_status;
+          if (previousState !== currentState) {
+            this.platform.log.info(
+              `${this.accessory.displayName}: Device state changed from ${previousState || 'unknown'} ` +
+            `to ${currentState}, adjusting polling interval`,
+            );
+            // Update UI first
+            this.publishUpdates();
+            // Then reschedule with the new appropriate interval
+            this.scheduleNextPollBasedOnState();
+            return; // Skip the normal schedule since we're rescheduling with a different interval
+          }
+
           this.publishUpdates();
-          // Then reschedule with the new appropriate interval
-          this.scheduleNextPollBasedOnState();
-          return; // Skip the normal schedule since we're rescheduling with a different interval
-        }
-        
-        this.publishUpdates();
-        this.platform.log.debug(`${this.accessory.displayName}: Current thermal control status: ${s.control.thermal_control_status}`);
-        
-        // Schedule next poll with the same interval
-        this.scheduleNextCheck(poller);
-      })
-      .catch(error => {
-        this.platform.log.error(`${this.accessory.displayName}: Error polling device after retries: ${error instanceof Error ? error.message : String(error)}`);
-        // Still schedule next check even if there was an error after all retries
-        this.scheduleNextCheck(poller);
-      });
+          this.platform.log.debug(`${this.accessory.displayName}: Current thermal control status: ${s.control.thermal_control_status}`);
+
+          // Schedule next poll with the same interval
+          this.scheduleNextCheck(poller);
+        })
+        .catch(error => {
+          this.platform.log.error(`${this.accessory.displayName}: Error polling device after retries: ${errorMessage(error)}`);
+          // Still schedule next check even if there was an error after all retries
+          this.scheduleNextCheck(poller);
+        });
     }, pollingInterval);
   }
 
-  private updateControlFromResponse(response: { data: Control }) {
-    if (!this.deviceStatus) {
-      return;
-    }
-    
-    // Check if the response state matches the expected state (if we have one)
-    if (this.expectedThermalState !== null && response.data.thermal_control_status !== this.expectedThermalState) {
-      this.platform.log.warn(`${this.accessory.displayName}: API returned ${response.data.thermal_control_status}, but expected ${this.expectedThermalState}. Not updating HomeKit.`);
-      // Don't update with the mismatched state
-      return;
-    }
-    
-    // Clear any expected state since the response matches (or we didn't have an expectation)
-    this.expectedThermalState = null;
-    
-    const previousState = this.deviceStatus.control.thermal_control_status;
-    this.deviceStatus.control = response.data;
-    this.platform.log(`${this.accessory.displayName}: API confirmed state: ${response.data.thermal_control_status.toUpperCase()}`);
-    
-    // If thermal state changed, update polling interval
-    if (previousState !== response.data.thermal_control_status) {
-      this.scheduleNextPollBasedOnState();
-    }
-    
-    this.publishUpdates();
-  }
-  
   // Publishes all characteristic updates to HomeKit
   private publishUpdates(): void {
     if (!this.deviceStatus) {
       return;
     }
-    
+
     const { Characteristic } = this.platform;
-    
+
     // Update thermostat characteristics
     this.thermostatService.updateCharacteristic(
       Characteristic.CurrentHeatingCoolingState,
-      newMapper(this.platform).toHeatingCoolingState(this.deviceStatus)
+      newMapper(this.platform).toHeatingCoolingState(this.deviceStatus),
     );
-    
+
     this.thermostatService.updateCharacteristic(
       Characteristic.TargetHeatingCoolingState,
-      this.deviceStatus.control.thermal_control_status === 'standby' ? 
-        Characteristic.TargetHeatingCoolingState.OFF : 
-        Characteristic.TargetHeatingCoolingState.AUTO
+      this.deviceStatus.control.thermal_control_status === 'standby' ?
+        Characteristic.TargetHeatingCoolingState.OFF :
+        Characteristic.TargetHeatingCoolingState.AUTO,
     );
-    
+
     const rawTemp = this.deviceStatus.status.water_temperature_c;
     if (typeof rawTemp !== 'number' || isNaN(rawTemp) || !isFinite(rawTemp)) {
       this.platform.log.warn(
-        `${this.accessory.displayName}: Invalid water temperature received: ${rawTemp}. Using default value.`
+        `${this.accessory.displayName}: Invalid water temperature received: ${rawTemp}. Using default value.`,
       );
     }
     const currentTemp = this.clampTemperature(rawTemp, 12, 46.7);
     this.thermostatService.updateCharacteristic(Characteristic.CurrentTemperature, currentTemp);
-    
+
     // Determine target temperature value considering special cases
     let targetTemp = this.deviceStatus.control.set_temperature_c;
     if (this.deviceStatus.control.set_temperature_f >= HIGH_TEMP_TARGET_F) {
@@ -739,57 +704,101 @@ export class SleepmePlatformAccessory {
     } else if (this.deviceStatus.control.set_temperature_f <= LOW_TEMP_TARGET_F) {
       targetTemp = 12.2; // Minimum allowed temperature (54°F)
     }
-    
+
     // Check if temperature is out of range before clamping
     if (targetTemp < 12 || targetTemp > 46.7) {
       this.platform.log.warn(
-        `${this.accessory.displayName}: API returned out-of-range target temperature: ${targetTemp}°C (${this.deviceStatus.control.set_temperature_f}°F). Clamping to valid range.`
+        `${this.accessory.displayName}: API returned out-of-range target temperature: ` +
+        `${targetTemp}°C (${this.deviceStatus.control.set_temperature_f}°F). Clamping to valid range.`,
       );
     }
-    
+
     // Always apply clamping to ensure we never send out-of-range values to HomeKit
     targetTemp = this.clampTemperature(targetTemp, 12, 46.7, 21);
     this.thermostatService.updateCharacteristic(Characteristic.TargetTemperature, targetTemp);
-    
+
     this.thermostatService.updateCharacteristic(
       Characteristic.TemperatureDisplayUnits,
-      this.deviceStatus.control.display_temperature_unit === 'c' ? 0 : 1
+      this.deviceStatus.control.display_temperature_unit === 'c' ? 0 : 1,
     );
-    
+
     // Update water level characteristics based on service type
     if (this.waterLevelType === 'leak') {
       this.waterLevelService.updateCharacteristic(
         Characteristic.LeakDetected,
-        this.deviceStatus.status.is_water_low ? 
-          Characteristic.LeakDetected.LEAK_DETECTED : 
-          Characteristic.LeakDetected.LEAK_NOT_DETECTED
+        this.deviceStatus.status.is_water_low ?
+          Characteristic.LeakDetected.LEAK_DETECTED :
+          Characteristic.LeakDetected.LEAK_NOT_DETECTED,
       );
     } else if (this.waterLevelType === 'motion') {
       this.waterLevelService.updateCharacteristic(
         Characteristic.MotionDetected,
-        this.deviceStatus.status.is_water_low
+        this.deviceStatus.status.is_water_low,
       );
     } else {
       // Battery service
       this.waterLevelService.updateCharacteristic(
         Characteristic.StatusLowBattery,
-        this.deviceStatus.status.is_water_low ? 
-          Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW : 
-          Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
+        this.deviceStatus.status.is_water_low ?
+          Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW :
+          Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL,
       );
-      
+
       this.waterLevelService.updateCharacteristic(
         Characteristic.BatteryLevel,
-        this.deviceStatus.status.water_level
+        this.deviceStatus.status.water_level,
       );
     }
-    
+
+    this.logWaterLevelChanges();
+
     // Log the state update if needed
     const state = this.deviceStatus.control.thermal_control_status;
     const temp = this.deviceStatus.control.set_temperature_f;
     const waterLevel = this.deviceStatus.status.water_level;
-    
+
     this.platform.log.debug(
-      `${this.accessory.displayName}: Updated HomeKit - State: ${state.toUpperCase()}, Temp: ${temp}°F, Water: ${waterLevel}%`
+      `${this.accessory.displayName}: Updated HomeKit - State: ${state.toUpperCase()}, Temp: ${temp}°F, Water: ${waterLevel}%`,
     );
-  }}
+  }
+
+  /**
+   * Records water level history at info level, so the Homebridge log preserves
+   * low-water events without needing debug logging enabled.
+   *
+   * `is_water_low` is the flag that actually drives the leak/motion sensor, so
+   * every transition is logged. The percentage is logged only when it changes,
+   * which stays silent for the common case of a tank that reads a steady 100%.
+   */
+  private logWaterLevelChanges(): void {
+    if (!this.deviceStatus) {
+      return;
+    }
+
+    const waterLevel = this.deviceStatus.status.water_level;
+    const isWaterLow = this.deviceStatus.status.is_water_low;
+
+    if (this.previousIsWaterLow === null) {
+      this.platform.log.info(
+        `${this.accessory.displayName}: Water level ${waterLevel}% at startup, low water flag is ${isWaterLow}`,
+      );
+    } else {
+      if (isWaterLow !== this.previousIsWaterLow) {
+        if (isWaterLow) {
+          this.platform.log.warn(`${this.accessory.displayName}: LOW WATER detected (level ${waterLevel}%)`);
+        } else {
+          this.platform.log.info(`${this.accessory.displayName}: Low water cleared (level ${waterLevel}%)`);
+        }
+      }
+      if (waterLevel !== this.previousWaterLevel) {
+        this.platform.log.info(
+          `${this.accessory.displayName}: Water level changed ` +
+          `${this.previousWaterLevel}% -> ${waterLevel}% (low water flag is ${isWaterLow})`,
+        );
+      }
+    }
+
+    this.previousWaterLevel = waterLevel;
+    this.previousIsWaterLow = isWaterLow;
+  }
+}

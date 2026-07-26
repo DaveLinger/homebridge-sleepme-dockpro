@@ -7,6 +7,22 @@ type ClientResponse<T> = {
   status: number;
 };
 
+/**
+ * Error thrown for every failed API call. Carries the HTTP status (used to detect
+ * rate limiting) and the underlying axios error code (used to detect timeouts).
+ */
+export class SleepmeApiError extends Error {
+  readonly statusCode?: number;
+  readonly code?: string;
+
+  constructor(message: string, statusCode?: number, code?: string) {
+    super(message);
+    this.name = 'SleepmeApiError';
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
 export class Client {
   readonly token: string;
   private readonly axiosClient: AxiosInstance
@@ -38,16 +54,21 @@ export class Client {
       const axiosError = error as AxiosError;
       const status = axiosError.response?.status;
       const statusText = axiosError.response?.statusText || 'Unknown error';
-      
+
       if (this.log) {
         if (status === 429) {
-          this.log.error(`API ${method} ${endpoint} - RATE LIMITED (429): Too many requests. The plugin will automatically retry. Consider increasing polling intervals in settings.`);
+          this.log.error(`API ${method} ${endpoint} - RATE LIMITED (429): Too many requests. ` +
+            'The plugin will automatically retry. Consider increasing polling intervals in settings.');
         } else if (status === 401 || status === 403) {
-          this.log.error(`API ${method} ${endpoint} - AUTHENTICATION ERROR (${status}): Invalid API token. Please verify your SleepMe API token in plugin settings. Get a new token at: https://docs.developer.sleep.me/docs/`);
+          this.log.error(`API ${method} ${endpoint} - AUTHENTICATION ERROR (${status}): Invalid API token. ` +
+            'Please verify your SleepMe API token in plugin settings. ' +
+            'Get a new token at: https://docs.developer.sleep.me/docs/');
         } else if (status === 404) {
-          this.log.error(`API ${method} ${endpoint} - NOT FOUND (404): Device or endpoint not found. The device may have been removed from your SleepMe account.`);
+          this.log.error(`API ${method} ${endpoint} - NOT FOUND (404): Device or endpoint not found. ` +
+            'The device may have been removed from your SleepMe account.');
         } else if (status && status >= 500) {
-          this.log.error(`API ${method} ${endpoint} - SERVER ERROR (${status}): SleepMe API is experiencing issues. The plugin will retry automatically.`);
+          this.log.error(`API ${method} ${endpoint} - SERVER ERROR (${status}): SleepMe API is experiencing issues. ` +
+            'The plugin will retry automatically.');
         } else if (axiosError.code === 'ECONNABORTED') {
           this.log.error(`API ${method} ${endpoint} - TIMEOUT: Request took longer than 30 seconds. Check your network connection.`);
         } else if (axiosError.code === 'ENOTFOUND' || axiosError.code === 'ECONNREFUSED') {
@@ -55,12 +76,12 @@ export class Client {
         } else {
           this.log.error(`API ${method} ${endpoint} - Error ${status}: ${statusText}`);
         }
-        
+
         // Log response details if available
         if (axiosError.response?.data) {
           try {
-            const data = typeof axiosError.response.data === 'object' 
-              ? JSON.stringify(axiosError.response.data) 
+            const data = typeof axiosError.response.data === 'object'
+              ? JSON.stringify(axiosError.response.data)
               : String(axiosError.response.data);
             this.log.debug(`API error details: ${data}`);
           } catch {
@@ -68,21 +89,20 @@ export class Client {
           }
         }
       }
-      
-      // Create an error with the status code for special handling of rate limits
-      const customError = new Error(`API error ${status}: ${statusText}`);
-      (customError as any).statusCode = status; // Add the status code to the error object for 429 detection
-      throw customError;
+
+      // Preserve the status code (for 429 detection) and the axios error code
+      // (for timeout detection) so callers can classify the failure.
+      throw new SleepmeApiError(`API error ${status}: ${statusText}`, status, axiosError.code);
     } else {
       // For non-axios errors
       const errorMessage = error instanceof Error ? error.message : String(error);
       if (this.log) {
         this.log.error(`API ${method} ${endpoint} - Unexpected error: ${errorMessage}`);
       }
-      throw new Error(`API error: ${errorMessage}`);
+      throw new SleepmeApiError(`API error: ${errorMessage}`);
     }
   }
-  
+
   async listDevices(): Promise<ClientResponse<Device[]>> {
     const endpoint = '/v1/devices';
     try {
@@ -109,9 +129,9 @@ export class Client {
     const endpoint = `/v1/devices/${id}`;
     try {
       const response = await this.axiosClient.patch<Control>(
-        endpoint, 
+        endpoint,
         {set_temperature_f: temperature},
-        {headers: this.headers()}
+        {headers: this.headers()},
       );
       this.logResponse(response, 'PATCH', endpoint);
       return response;
@@ -124,9 +144,9 @@ export class Client {
     const endpoint = `/v1/devices/${id}`;
     try {
       const response = await this.axiosClient.patch<Control>(
-        endpoint, 
+        endpoint,
         {set_temperature_c: temperature},
-        {headers: this.headers()}
+        {headers: this.headers()},
       );
       this.logResponse(response, 'PATCH', endpoint);
       return response;
@@ -141,7 +161,7 @@ export class Client {
       const response = await this.axiosClient.patch<Control>(
         endpoint,
         {display_temperature_unit: unit},
-        {headers: this.headers()}
+        {headers: this.headers()},
       );
       this.logResponse(response, 'PATCH', endpoint);
       return response;
@@ -154,9 +174,9 @@ export class Client {
     const endpoint = `/v1/devices/${id}`;
     try {
       const response = await this.axiosClient.patch<Control>(
-        endpoint, 
+        endpoint,
         {thermal_control_status: targetState},
-        {headers: this.headers()}
+        {headers: this.headers()},
       );
       this.logResponse(response, 'PATCH', endpoint);
       return response;

@@ -26,6 +26,26 @@
           "description": "Enter your SleepMe API token"
         }
       },
+      "device_ids": {
+        "title": "Device ID Allowlist",
+        "description": "Optional. Leave empty to add every Dock Pro on your account. If you list any device IDs here, ONLY those devices are added. Device IDs appear in the Homebridge log as 'Adding new accessory' entries.",
+        "type": "array",
+        "items": {
+          "title": "Device ID",
+          "type": "string",
+          "placeholder": "zx-abcd1234efgh5678"
+        }
+      },
+      "supported_models": {
+        "title": "Supported Models",
+        "description": "Optional escape hatch. Defaults to DP999NA (Dock Pro). Devices reporting any other model are skipped, so newer SleepMe products (such as the ST501NA Sleep Tracker) are not added as thermostats that never update. If SleepMe ships a new Dock Pro with a different model code, add it here.",
+        "type": "array",
+        "items": {
+          "title": "Model Code",
+          "type": "string",
+          "placeholder": "DP999NA"
+        }
+      },
       "water_level_type": {
         "title": "Water Level Alert Type",
         "type": "string",
@@ -100,6 +120,24 @@
       "expandable": true,
       "expanded": false,
       "items": [
+        {
+          "type": "help",
+          "helpvalue": "<h5>Device Filtering</h5><p>By default every device on your account that reports the Dock Pro model (DP999NA) is added. Other SleepMe products do not report water level or water temperature, so they are skipped rather than added as thermostats that never update.</p>"
+        },
+        {
+          "key": "device_ids",
+          "type": "array",
+          "title": "Device ID Allowlist",
+          "buttonText": "Add Device ID",
+          "description": "🎯 Leave empty for all Dock Pros. Add IDs to restrict the plugin to specific devices."
+        },
+        {
+          "key": "supported_models",
+          "type": "array",
+          "title": "Supported Models",
+          "buttonText": "Add Model Code",
+          "description": "🏷️ Leave empty to use the default (DP999NA). Only change this if SleepMe ships a Dock Pro with a new model code."
+        },
         {
           "key": "water_level_type",
           "title": "Water Level Alert Type",

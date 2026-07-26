@@ -1,7 +1,7 @@
 // filename: src/platform.ts
 import {API, DynamicPlatformPlugin, Logging, PlatformAccessory, Service, Characteristic} from 'homebridge';
 
-import {Client} from './sleepme/client.js';
+import {Client, DeviceStatus} from './sleepme/client.js';
 
 import {PLATFORM_NAME, PLUGIN_NAME} from './settings.js';
 import {SleepmePlatformAccessory} from './platformAccessory.js';
@@ -9,23 +9,42 @@ import {SleepmePlatformAccessory} from './platformAccessory.js';
 export type PluginConfig = {
   api_keys: string[];
   platform: string;
+  device_ids?: string[];
+  supported_models?: string[];
 };
 
-const validateConfig = (config: any):[boolean, string] => {
-  if(!config.api_keys || !Array.isArray(config.api_keys)) {
-    return [false, "No API keys configured. Please add your SleepMe API token in the plugin settings. Create an API token at: https://docs.developer.sleep.me/docs/"]
+// Only the Dock Pro exposes the thermal and water fields this plugin drives. Other
+// SleepMe products report a different model — the ST501NA Sleep Tracker, for one,
+// has no water_level or is_water_low at all — and would otherwise be registered as
+// a thermostat whose readings never update.
+const DEFAULT_SUPPORTED_MODELS = ['DP999NA'];
+
+const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+// The config arrives as user-authored JSON, so every field is validated at runtime
+// rather than trusted from the PluginConfig type.
+const validateConfig = (config: PluginConfig): [boolean, string] => {
+  const apiKeys: unknown = config.api_keys;
+  const tokenDocsUrl = 'https://docs.developer.sleep.me/docs/';
+
+  if (!apiKeys || !Array.isArray(apiKeys)) {
+    return [false, 'No API keys configured. Please add your SleepMe API token in the plugin settings. ' +
+      `Create an API token at: ${tokenDocsUrl}`];
   }
-  if (config.api_keys.length === 0) {
-    return [false, "API keys array is empty. Please add at least one SleepMe API token. Create an API token at: https://docs.developer.sleep.me/docs/"]
+  if (apiKeys.length === 0) {
+    return [false, 'API keys array is empty. Please add at least one SleepMe API token. ' +
+      `Create an API token at: ${tokenDocsUrl}`];
   }
-  if (config.api_keys.some((s:unknown) => typeof s !== 'string')) {
-    return [false, "One or more API keys are invalid (must be text strings). Please check your API tokens in the plugin settings."]
+  if (apiKeys.some((key: unknown) => typeof key !== 'string')) {
+    return [false, 'One or more API keys are invalid (must be text strings). ' +
+      'Please check your API tokens in the plugin settings.'];
   }
-  if (config.api_keys.some((s:string) => s.trim().length === 0)) {
-    return [false, "One or more API keys are empty. Please remove empty entries and ensure all API tokens are valid."]
+  if (apiKeys.some((key: string) => key.trim().length === 0)) {
+    return [false, 'One or more API keys are empty. ' +
+      'Please remove empty entries and ensure all API tokens are valid.'];
   }
-  return [true, '']
-}
+  return [true, ''];
+};
 
 // When this event is fired it means Homebridge has restored all cached accessories from disk.
 // Dynamic Platform plugins should only register new accessories after this event was fired,
@@ -55,7 +74,7 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
     }
 
     this.log.debug('Finished initializing platform:', config.platform);
-this.api.on(didFinishLaunching, () => {
+    this.api.on(didFinishLaunching, () => {
       log.debug('Executed didFinishLaunching callback');
       this.discoverDevices();
     });
@@ -78,10 +97,51 @@ this.api.on(didFinishLaunching, () => {
    * must not be registered again to prevent "duplicate UUID" errors.
    */
   discoverDevices() {
+    const allowedIds = (this.config.device_ids ?? [])
+      .filter((id: unknown): id is string => typeof id === 'string' && id.trim().length > 0)
+      .map(id => id.trim());
+    const supportedModels = this.config.supported_models?.length
+      ? this.config.supported_models
+      : DEFAULT_SUPPORTED_MODELS;
+
+    if (allowedIds.length > 0) {
+      this.log.info(`Device allowlist active — only these device IDs will be added: ${allowedIds.join(', ')}`);
+    }
+
     this.config.api_keys.forEach(key => {
       const client = new Client(key, undefined, this.log);
-      client.listDevices().then(r => {
-        r.data.forEach(device => {
+      client.listDevices().then(async r => {
+        for (const device of r.data) {
+          if (allowedIds.length > 0 && !allowedIds.includes(device.id)) {
+            this.log.info(`Skipping "${device.name}" (${device.id}): not in the configured device ID allowlist`);
+            continue;
+          }
+
+          // The device list does not include the model, so read the status here to
+          // identify it. The status is handed to the accessory below so it does not
+          // fetch again, keeping startup at one status call per device.
+          let initialStatus: DeviceStatus | undefined;
+          try {
+            initialStatus = (await client.getDeviceStatus(device.id)).data;
+          } catch (error) {
+            this.log.warn(
+              `Could not read status for "${device.name}" (${device.id}) during discovery: ${errorMessage(error)}. ` +
+              'Adding it anyway without a model check.',
+            );
+          }
+
+          // Only skip on a model we positively identified as unsupported. If the status
+          // call failed we add the device rather than risk dropping a working dock.
+          const model = initialStatus?.about.model;
+          if (model && !supportedModels.includes(model)) {
+            this.log.info(
+              `Skipping "${device.name}" (${device.id}): model ${model} is not a supported Dock Pro ` +
+              `(supported: ${supportedModels.join(', ')}). ` +
+              'If this is a Dock Pro, add its model to supported_models in the plugin config.',
+            );
+            continue;
+          }
+
           const uuid = this.api.hap.uuid.generate(device.id);
           const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
           if (existingAccessory) {
@@ -94,7 +154,7 @@ this.api.on(didFinishLaunching, () => {
 
             // create the accessory handler for the restored accessory
             // this is imported from `platformAccessory.ts`
-            new SleepmePlatformAccessory(this, existingAccessory);
+            new SleepmePlatformAccessory(this, existingAccessory, initialStatus);
 
             // it is possible to remove platform accessories at any time using `api.unregisterPlatformAccessories`, e.g.:
             // remove platform accessories when no longer present
@@ -113,13 +173,13 @@ this.api.on(didFinishLaunching, () => {
 
             // create the accessory handler for the newly create accessory
             // this is imported from `platformAccessory.ts`
-            new SleepmePlatformAccessory(this, accessory);
+            new SleepmePlatformAccessory(this, accessory, initialStatus);
             // link the accessory to your platform
             this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
           }
-        });
+        }
       }).catch(error => {
-        this.log.error(`Failed to discover devices: ${error instanceof Error ? error.message : String(error)}`);
+        this.log.error(`Failed to discover devices: ${errorMessage(error)}`);
       });
     });
   }
