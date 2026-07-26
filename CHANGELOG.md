@@ -5,32 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-07-26
 
 ### Added
 - A real test suite: 42 tests across the rate limiter, the platform's discovery filtering and config validation, and the accessory's polling scale, water logging, command suppression, debounce, and behaviour at the rate limit. `npm test` no longer passes vacuously — `--passWithNoTests` is gone, so an empty or broken suite fails CI.
 - `SleepmePlatformAccessory.dispose()` and `SleepmePlatform.disposeAll()`, wired to Homebridge's `shutdown` event, so the plugin cancels its timers on exit instead of leaving them running.
-
-### Fixed
-- Three timers were started without keeping their handles and so could never be cancelled: the hourly metrics `setInterval`, the 2-second post-command poll reschedule, and the temperature debounce. The reschedule timer is now also replaced rather than stacked, so a burst of power toggles leaves one pending reschedule instead of one per tap.
-- `package-lock.json` still declared version 1.1.7 after the 1.2.0 and 1.3.0 bumps, because those were applied to `package.json` by hand rather than through `release-it`. This would have failed the switch to `npm ci` below.
-- CI installs with `npm ci` instead of `npm install`, so the build is tested against the exact dependency tree described by the lockfile rather than whatever resolves on the day.
-- The "List, audit, fix outdated dependencies and build again" step ran `npm audit fix` and then rebuilt against the mutated tree, which could fail a build for reasons unrelated to the commit and threw the fix away regardless. Its `npm list --outdated` calls were also silently no-ops — `--outdated` is not a flag `npm list` accepts, so it exited 0 without reporting anything. Dependency reporting now lives in a separate `audit` job marked `continue-on-error`, using the real `npm outdated`.
+- Temperature writes are debounced by 500ms. Dragging the slider in the Home app emits a write per step, and every intermediate value is distinct, so deduplication alone did not help: one gesture could previously spend most of a minute's request quota. Only the value the user settles on is now sent. The delay is not perceptible because the optimistic update has already moved the UI before the request is queued. Power on/off is deliberately not debounced — those are single deliberate taps where latency matters most.
+- Client-side rate limiting. The SleepMe API allows 10 requests per minute per account, and the plugin now tracks its own usage against a fixed wall-clock minute window to match the documented "discrete minute" semantics. Reads and writes are budgeted separately: 4 requests are held in reserve so a tap in the Home app is never blocked by background polling. A poll with no budget is skipped and rescheduled rather than retried, since retrying a full window only makes it worse; a command with no budget waits for the window to reset instead of spending a retry on a request that would 429.
+- One shared `Client` per API token, created by the platform. Previously three separate call sites constructed clients, including a fresh one inside the poller closure on every reschedule, so nothing could observe the account's aggregate request rate. Because the quota is per account, the limiter lives with the client and is shared by every device behind a token.
 
 ### Changed
 - The build workflow accepts `workflow_dispatch`, so a run can be started by hand from the Actions tab without inventing a commit.
 - Added a `concurrency` group so a burst of pushes to the same branch cancels superseded runs instead of queueing them.
 - Enabled npm caching in `actions/setup-node`.
 - `tsc --noEmit` type-checks the test files, while a new `tsconfig.build.json` keeps them and their shared helpers out of `dist`, so nothing test-related is published.
-
-## [1.3.0] - 2026-07-26
-
-### Added
-- Temperature writes are debounced by 500ms. Dragging the slider in the Home app emits a write per step, and every intermediate value is distinct, so deduplication alone did not help: one gesture could previously spend most of a minute's request quota. Only the value the user settles on is now sent. The delay is not perceptible because the optimistic update has already moved the UI before the request is queued. Power on/off is deliberately not debounced — those are single deliberate taps where latency matters most.
-- Client-side rate limiting. The SleepMe API allows 10 requests per minute per account, and the plugin now tracks its own usage against a fixed wall-clock minute window to match the documented "discrete minute" semantics. Reads and writes are budgeted separately: 4 requests are held in reserve so a tap in the Home app is never blocked by background polling. A poll with no budget is skipped and rescheduled rather than retried, since retrying a full window only makes it worse; a command with no budget waits for the window to reset instead of spending a retry on a request that would 429.
-- One shared `Client` per API token, created by the platform. Previously three separate call sites constructed clients, including a fresh one inside the poller closure on every reschedule, so nothing could observe the account's aggregate request rate. Because the quota is per account, the limiter lives with the client and is shared by every device behind a token.
-
-### Changed
 - The active polling interval now scales with the number of devices sharing an API token, keeping total polling at or below the account's request budget regardless of device count. The safe floor is 10 seconds per device, so two devices set to 10s are polled every 20s, three every 30s. A configured value already above the floor is used unchanged — two devices left at the 45s default stay at 45s rather than being stretched to 90s. Standby polling is not scaled; even four devices at the 15 minute default cost well under one request per minute.
 - Redundant commands are no longer sent. A temperature write is skipped when it matches what the device is already set to, compared on the value actually sent so that Celsius settings collapsing onto the same LOW/HIGH sentinel are not resent. A thermal state write is skipped only when the state is confirmed and no command is in flight, so a genuine turn-on is never dropped.
 - The optimistic temperature update now stores the value sent to the API rather than the raw Fahrenheit conversion, so local state matches what the device reports back.
@@ -38,9 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Device discovery waits out the rate limit window if the polling budget is exhausted mid-discovery, so an account with more devices than the per-minute budget does not silently lose the model check on the later ones.
 
 ### Fixed
+- Three timers were started without keeping their handles and so could never be cancelled: the hourly metrics `setInterval`, the 2-second post-command poll reschedule, and the temperature debounce. The reschedule timer is now also replaced rather than stacked, so a burst of power toggles leaves one pending reschedule instead of one per tap.
+- `package-lock.json` still declared version 1.1.7 after the 1.2.0 and 1.3.0 bumps, because those were applied to `package.json` by hand rather than through `release-it`. This would have failed the switch to `npm ci` below.
+- CI installs with `npm ci` instead of `npm install`, so the build is tested against the exact dependency tree described by the lockfile rather than whatever resolves on the day.
+- The "List, audit, fix outdated dependencies and build again" step ran `npm audit fix` and then rebuilt against the mutated tree, which could fail a build for reasons unrelated to the commit and threw the fix away regardless. Its `npm list --outdated` calls were also silently no-ops — `--outdated` is not a flag `npm list` accepts, so it exited 0 without reporting anything. Dependency reporting now lives in a separate `audit` job marked `continue-on-error`, using the real `npm outdated`.
 - Hitting the internal rate limit is now invisible in HomeKit. A deferred poll leaves every characteristic untouched, so the accessory keeps showing its last known values instead of going stale or erroring, and `onGet` continues to answer instantly from cache because it never makes an API call. A delayed command does not block the Home app either: the `onSet` handlers resolve as soon as the optimistic update is applied and let the request run detached. The only trace is a single warning in the Homebridge log.
 - A deferred poll during the initial status fetch or during the post-failure status refresh no longer logs a misleading error. Both are expected outcomes of the rate limiter and are logged at debug.
-
 ## [1.2.0] - 2026-07-26
 
 ### Added
