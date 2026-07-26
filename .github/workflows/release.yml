@@ -58,6 +58,13 @@ jobs:
       # has to be passed explicitly or a minor release silently ships as a patch.
       # There is no NPM_TOKEN: npm authenticates over OIDC. GITHUB_TOKEN is the
       # automatic per-run token, used only to create the GitHub release.
-      - run: npx release-it ${{ inputs.increment }} ${{ inputs.dry_run && '--dry-run' || '' }}
+      #
+      # A dry run also skips the npm publish step. release-it only simulates the
+      # version bump, so package.json still carries the released version when it
+      # hands the package to `npm publish --dry-run` — and npm's dry run still
+      # asks the registry, which rejects it as already published. That failure is
+      # an artifact of rehearsing, not a signal, and it would occur on every dry
+      # run. Publishing cannot be rehearsed against npm anyway.
+      - run: npx release-it ${{ inputs.increment }} ${{ inputs.dry_run && '--dry-run --no-npm.publish' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
