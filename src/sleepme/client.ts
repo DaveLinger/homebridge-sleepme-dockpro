@@ -1,6 +1,7 @@
 // filename: src/sleepme/client.ts
 import axios, {AxiosInstance, AxiosResponse, AxiosError} from 'axios';
 import {Logging} from 'homebridge';
+import {RateLimiter, RateLimitDeferredError, RequestKind} from './rateLimiter.js';
 
 type ClientResponse<T> = {
   data: T;
@@ -27,14 +28,49 @@ export class Client {
   readonly token: string;
   private readonly axiosClient: AxiosInstance
   private readonly log?: Logging;
+  private readonly limiter?: RateLimiter;
 
-  constructor(token: string, baseURL = 'https://api.developer.sleep.me', log?: Logging) {
+  /**
+   * One Client per API token. The rate limit is per account, so every device
+   * behind a token must share a single instance for the limiter to see the
+   * account's true request rate.
+   */
+  constructor(token: string, baseURL = 'https://api.developer.sleep.me', log?: Logging, limiter?: RateLimiter) {
     this.token = token;
     this.axiosClient = axios.create({
       baseURL: baseURL,
       timeout: 30000, // 30 second timeout to prevent hanging requests
     });
     this.log = log;
+    this.limiter = limiter;
+  }
+
+  /**
+   * Claims quota before a request goes out.
+   *
+   * Reads are classified as polls and writes as commands, which is what gives
+   * user actions priority: polls draw on the smaller budget and are deferred
+   * when it runs dry, while commands may use the full quota and wait for the
+   * next window rather than be dropped.
+   */
+  private async acquire(kind: RequestKind): Promise<void> {
+    if (!this.limiter || this.limiter.tryAcquire(kind)) {
+      return;
+    }
+
+    if (kind === 'poll') {
+      throw new RateLimitDeferredError(this.limiter.msUntilNextWindow());
+    }
+
+    // A command only gets here once the account has spent all 10 requests, in
+    // which case the server would answer 429 anyway. Waiting out the window is
+    // strictly better than burning a retry on a request we know will fail.
+    const waitMs = this.limiter.msUntilNextWindow();
+    this.log?.warn(
+      `API rate limit reached; holding this command for ${Math.ceil(waitMs / 1000)}s until the quota resets.`,
+    );
+    await new Promise(resolve => setTimeout(resolve, waitMs + 50));
+    this.limiter.tryAcquire(kind);
   }
 
   headers(): object {
@@ -105,6 +141,8 @@ export class Client {
 
   async listDevices(): Promise<ClientResponse<Device[]>> {
     const endpoint = '/v1/devices';
+    // Outside the try: a deferred poll must not be rewritten into a SleepmeApiError.
+    await this.acquire('poll');
     try {
       const response = await this.axiosClient.get<Device[]>(endpoint, {headers: this.headers()});
       this.logResponse(response, 'GET', endpoint);
@@ -116,6 +154,8 @@ export class Client {
 
   async getDeviceStatus(id: string): Promise<ClientResponse<DeviceStatus>> {
     const endpoint = `/v1/devices/${id}`;
+    // Outside the try: a deferred poll must not be rewritten into a SleepmeApiError.
+    await this.acquire('poll');
     try {
       const response = await this.axiosClient.get<DeviceStatus>(endpoint, {headers: this.headers()});
       this.logResponse(response, 'GET', endpoint);
@@ -127,6 +167,7 @@ export class Client {
 
   async setTemperatureFahrenheit(id: string, temperature: number): Promise<ClientResponse<Control>> {
     const endpoint = `/v1/devices/${id}`;
+    await this.acquire('command');
     try {
       const response = await this.axiosClient.patch<Control>(
         endpoint,
@@ -142,6 +183,7 @@ export class Client {
 
   async setTemperatureCelsius(id: string, temperature: number): Promise<ClientResponse<Control>> {
     const endpoint = `/v1/devices/${id}`;
+    await this.acquire('command');
     try {
       const response = await this.axiosClient.patch<Control>(
         endpoint,
@@ -157,6 +199,7 @@ export class Client {
 
   async setDisplayTemperatureUnit(id: string, unit: 'c' | 'f'): Promise<ClientResponse<Control>> {
     const endpoint = `/v1/devices/${id}`;
+    await this.acquire('command');
     try {
       const response = await this.axiosClient.patch<Control>(
         endpoint,
@@ -172,6 +215,7 @@ export class Client {
 
   async setThermalControlStatus(id: string, targetState: 'standby' | 'active'): Promise<ClientResponse<Control>> {
     const endpoint = `/v1/devices/${id}`;
+    await this.acquire('command');
     try {
       const response = await this.axiosClient.patch<Control>(
         endpoint,

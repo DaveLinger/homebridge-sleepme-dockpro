@@ -3,6 +3,7 @@ import {CharacteristicValue, PlatformAccessory, Service} from 'homebridge';
 
 import {SleepmePlatform} from './platform.js';
 import {Client, Device, DeviceStatus, SleepmeApiError} from './sleepme/client.js';
+import {POLL_BUDGET_PER_MINUTE, RateLimitDeferredError, REQUESTS_PER_MINUTE} from './sleepme/rateLimiter.js';
 
 type SleepmeContext = {
   device: Device;
@@ -64,9 +65,20 @@ const errorMessage = (error: unknown): string => (error instanceof Error ? error
 // Default polling intervals
 const DEFAULT_ACTIVE_POLLING_INTERVAL_SECONDS = 45;   // 45 seconds when device is active
 const DEFAULT_STANDBY_POLLING_INTERVAL_MINUTES = 15;  // 15 minutes when device is in standby
-// Floors must stay in sync with the `minimum` values in config.schema.json
-const MIN_ACTIVE_POLLING_INTERVAL_SECONDS = 10;
+// Smallest safe active interval for a SINGLE device: the account's polling budget
+// spread across a minute. With N devices on one token the floor becomes N times
+// this, which keeps total polling at POLL_BUDGET_PER_MINUTE regardless of count.
+const MIN_ACTIVE_SECONDS_PER_DEVICE = Math.ceil(60 / POLL_BUDGET_PER_MINUTE);
+// Standby polling is not scaled: at the 15 minute default even four devices cost
+// well under one request per minute, and stretching it would only delay noticing
+// a state change for no quota benefit.
 const MIN_STANDBY_POLLING_INTERVAL_MINUTES = 1;
+// Dragging the temperature slider in the Home app emits a write per step, so a
+// single gesture can produce a dozen distinct values in a couple of seconds. Only
+// the value the user settles on is worth sending. This window is short enough to
+// feel instant — the optimistic update has already moved the UI — and long enough
+// to swallow a whole drag.
+const TEMPERATURE_DEBOUNCE_MS = 500;
 const INITIAL_RETRY_DELAY_MS = 15000;                 // 15 seconds for first retry
 const MAX_RETRY_DELAY_MS = 60000;                     // Cap retry delay at 60 seconds
 const MAX_RETRIES = 3;                                // Maximum number of retry attempts
@@ -87,6 +99,9 @@ export class SleepmePlatformAccessory {
   // Previous water readings, so transitions can be logged at info level (see publishUpdates)
   private previousWaterLevel: number | null = null;
   private previousIsWaterLow: boolean | null = null;
+  // Coalesces a burst of slider writes into one request (see queueTemperatureCommand)
+  private pendingTemperatureF: number | null = null;
+  private temperatureDebounce: NodeJS.Timeout | undefined;
 
   // Metrics tracking
   private metrics = {
@@ -105,32 +120,42 @@ export class SleepmePlatformAccessory {
     private readonly platform: SleepmePlatform,
     private readonly accessory: PlatformAccessory,
     initialStatus?: DeviceStatus,
+    deviceCount = 1,
   ) {
     const {Characteristic} = this.platform;
     const {apiKey, device} = this.accessory.context as SleepmeContext;
-    const client = new Client(apiKey, undefined, this.platform.log);
+    // Shared per token so the rate limiter sees the whole account's traffic.
+    const client = this.platform.clientFor(apiKey);
     this.deviceStatus = null;
 
     // Get configuration
     const config = this.platform.config as PlatformConfig;
     this.waterLevelType = config.water_level_type || 'battery';
 
-    // Set up active polling interval from config or use default
-    const configuredActiveSeconds = config.active_polling_interval_seconds;
-    if (configuredActiveSeconds !== undefined) {
-      if (configuredActiveSeconds < MIN_ACTIVE_POLLING_INTERVAL_SECONDS) {
-        this.platform.log.warn(
-          `Active polling interval must be at least ${MIN_ACTIVE_POLLING_INTERVAL_SECONDS} seconds. ` +
-          `Using ${MIN_ACTIVE_POLLING_INTERVAL_SECONDS} seconds.`,
-        );
-        this.activePollingIntervalMs = MIN_ACTIVE_POLLING_INTERVAL_SECONDS * 1000;
-      } else {
-        this.activePollingIntervalMs = configuredActiveSeconds * 1000;
-        this.platform.log.debug(`Using configured active polling interval of ${configuredActiveSeconds} seconds`);
-      }
+    // Active polling scales with how many devices share this token's quota.
+    //
+    // The account gets POLL_BUDGET_PER_MINUTE polling requests per minute, so one
+    // device can safely poll every 60 / that budget seconds, and N devices need N
+    // times that. Taking the max with the configured value means the scaling only
+    // ever raises an interval that would breach the quota: two docks left at the
+    // 45s default stay at 45s rather than being stretched to 90s, while two docks
+    // set to the 10s floor land on 20s.
+    const minSafeActiveSeconds = MIN_ACTIVE_SECONDS_PER_DEVICE * deviceCount;
+    const requestedActiveSeconds = config.active_polling_interval_seconds ?? DEFAULT_ACTIVE_POLLING_INTERVAL_SECONDS;
+    const effectiveActiveSeconds = Math.max(requestedActiveSeconds, minSafeActiveSeconds);
+    this.activePollingIntervalMs = effectiveActiveSeconds * 1000;
+
+    if (effectiveActiveSeconds > requestedActiveSeconds) {
+      this.platform.log.info(
+        `${this.accessory.displayName}: Active polling interval raised from ${requestedActiveSeconds}s to ` +
+        `${effectiveActiveSeconds}s because ${deviceCount} devices share this account's quota of ` +
+        `${REQUESTS_PER_MINUTE} requests per minute.`,
+      );
     } else {
-      this.activePollingIntervalMs = DEFAULT_ACTIVE_POLLING_INTERVAL_SECONDS * 1000;
-      this.platform.log.debug(`Using default active polling interval of ${DEFAULT_ACTIVE_POLLING_INTERVAL_SECONDS} seconds`);
+      this.platform.log.debug(
+        `${this.accessory.displayName}: Active polling interval ${effectiveActiveSeconds}s ` +
+        `(safe floor for ${deviceCount} device(s) is ${minSafeActiveSeconds}s)`,
+      );
     }
 
     // Set up standby polling interval from config or use default
@@ -211,6 +236,11 @@ export class SleepmePlatformAccessory {
       client.getDeviceStatus(device.id)
         .then(statusResponse => this.applyDeviceStatus(statusResponse.data))
         .catch(error => {
+          if (error instanceof RateLimitDeferredError) {
+            // Not a failure — the polling cycle will pick the status up shortly.
+            this.platform.log.debug(`${this.accessory.displayName}: ${error.message}`);
+            return;
+          }
           this.platform.log.error(
             `Failed to get initial device status for ${this.accessory.displayName}: ${errorMessage(error)}`,
           );
@@ -233,6 +263,60 @@ export class SleepmePlatformAccessory {
         this.logMetricsSummary('debug');
       }
     }, 60 * 60 * 1000); // Every hour
+  }
+
+  /**
+   * Coalesces temperature writes so a slider drag costs one API request.
+   *
+   * Each write replaces the pending value and restarts the timer, so only the value
+   * the user settles on is sent. HomeKit is never made to wait: the caller has
+   * already applied the optimistic update and returned, and the request itself runs
+   * detached with its own error handling.
+   */
+  private queueTemperatureCommand(client: Client, device: Device, apiTemp: number): void {
+    this.pendingTemperatureF = apiTemp;
+
+    if (this.temperatureDebounce) {
+      clearTimeout(this.temperatureDebounce);
+      this.platform.log.debug(
+        `${this.accessory.displayName}: Superseding queued temperature command with ${apiTemp}°F`,
+      );
+    }
+
+    this.temperatureDebounce = setTimeout(() => {
+      this.temperatureDebounce = undefined;
+      const target = this.pendingTemperatureF;
+      this.pendingTemperatureF = null;
+      if (target === null) {
+        return;
+      }
+
+      this.retryApiCall(
+        () => client.setTemperatureFahrenheit(device.id, target),
+        this.accessory.displayName,
+        'set temperature',
+      )
+        .catch(error => {
+          this.platform.log.error(
+            `${this.accessory.displayName}: Failed to set temperature after retries: ${errorMessage(error)}`,
+          );
+          // Revert optimistic update by fetching actual device state
+          return client.getDeviceStatus(device.id)
+            .then(statusResponse => {
+              this.deviceStatus = statusResponse.data;
+              this.publishUpdates();
+            })
+            .catch(refreshError => {
+              if (refreshError instanceof RateLimitDeferredError) {
+                this.platform.log.debug(`${this.accessory.displayName}: ${refreshError.message}`);
+                return;
+              }
+              this.platform.log.error(
+                `${this.accessory.displayName}: Failed to refresh status after error: ${errorMessage(refreshError)}`,
+              );
+            });
+        });
+    }, TEMPERATURE_DEBOUNCE_MS);
   }
 
   // Adopts a fresh device status: stores it, refreshes the reported firmware
@@ -261,6 +345,13 @@ export class SleepmePlatformAccessory {
       this.metrics.lastSuccessfulPoll = new Date();
       return result;
     }).catch(error => {
+      // A deferred poll is not a failure. No request left the process, so it must not
+      // be retried (that would hammer a window that is already full) and must not be
+      // counted against the metrics. The caller reschedules instead.
+      if (error instanceof RateLimitDeferredError) {
+        throw error;
+      }
+
       // Track failed API call
       const statusCode = error instanceof SleepmeApiError ? error.statusCode : undefined;
       const errorCode = error instanceof SleepmeApiError ? error.code : undefined;
@@ -398,6 +489,21 @@ export class SleepmePlatformAccessory {
         .orElse(Characteristic.TargetHeatingCoolingState.OFF))
       .onSet(async (value: CharacteristicValue) => {
         const targetState = (value === Characteristic.TargetHeatingCoolingState.OFF) ? 'standby' : 'active';
+
+        // Skip a command that asks for the state the device is already in — with a
+        // quota of 10 requests a minute, redundant writes are expensive. This is
+        // deliberately conservative: it only fires when the state is confirmed
+        // (expectedThermalState is null, so no command is in flight) and known from
+        // a real reading. Anything less certain still sends, because silently
+        // dropping a genuine turn-on is far worse than spending a request.
+        if (this.deviceStatus && this.expectedThermalState === null &&
+            this.deviceStatus.control.thermal_control_status === targetState) {
+          this.platform.log.debug(
+            `${this.accessory.displayName}: Ignoring redundant state command — already ${targetState}`,
+          );
+          return;
+        }
+
         this.platform.log(`${this.accessory.displayName}: HomeKit state changed to ${targetState}`);
 
         // Store the expected state
@@ -478,49 +584,50 @@ export class SleepmePlatformAccessory {
         // Map to special API values for extremes
         let apiTemp = tempF;
         if (tempF > HIGH_TEMP_THRESHOLD_F) {
+          apiTemp = HIGH_TEMP_TARGET_F;
+        } else if (tempF < LOW_TEMP_THRESHOLD_F) {
+          apiTemp = LOW_TEMP_TARGET_F;
+        }
+
+        // Skip a write that would not change anything. The comparison is against the
+        // value actually sent rather than the HomeKit value, because the sentinel
+        // mapping above collapses a whole range of settings onto one request: 46.5°C
+        // and 46.7°C are both 999°F, so only the first needs to go out. Dragging the
+        // slider emits a value per step, and at 10 requests a minute those add up.
+        if (this.deviceStatus && this.deviceStatus.control.set_temperature_f === apiTemp) {
+          this.platform.log.debug(
+            `${this.accessory.displayName}: Ignoring redundant temperature command — already set to ${apiTemp}°F`,
+          );
+          return;
+        }
+
+        if (apiTemp === HIGH_TEMP_TARGET_F) {
           this.platform.log(
             `${this.accessory.displayName}: Temperature over ${HIGH_TEMP_THRESHOLD_F}F, ` +
             `mapping to ${HIGH_TEMP_TARGET_F}F for API call`,
           );
-          apiTemp = HIGH_TEMP_TARGET_F;
-        } else if (tempF < LOW_TEMP_THRESHOLD_F) {
+        } else if (apiTemp === LOW_TEMP_TARGET_F) {
           this.platform.log(
             `${this.accessory.displayName}: Temperature under ${LOW_TEMP_THRESHOLD_F}F, ` +
             `mapping to ${LOW_TEMP_TARGET_F}F for API call`,
           );
-          apiTemp = LOW_TEMP_TARGET_F;
         } else {
           this.platform.log(`${this.accessory.displayName}: Setting temperature to: ${tempC}°C (${tempF}°F)`);
         }
 
-        // Optimistic update — only possible if we already have device state
+        // Optimistic update — only possible if we already have device state.
+        // set_temperature_f stores the value sent, so it matches what the device will
+        // report back and keeps the dedup check above correct for repeated HIGH/LOW sets.
         if (this.deviceStatus) {
           this.deviceStatus.control.set_temperature_c = tempC;
-          this.deviceStatus.control.set_temperature_f = tempF;
+          this.deviceStatus.control.set_temperature_f = apiTemp;
           this.publishUpdates();
         }
 
-        // Send the command to the API — fires regardless of whether deviceStatus is populated.
-        // Not returned: all error paths are handled in .catch() and the handler always resolves void.
-        this.retryApiCall(
-          () => client.setTemperatureFahrenheit(device.id, apiTemp),
-          this.accessory.displayName,
-          'set temperature',
-        )
-          .catch(error => {
-            this.platform.log.error(`${this.accessory.displayName}: Failed to set temperature after retries: ${errorMessage(error)}`);
-            // Revert optimistic update by fetching actual device state
-            return client.getDeviceStatus(device.id)
-              .then(statusResponse => {
-                this.deviceStatus = statusResponse.data;
-                this.publishUpdates();
-              })
-              .catch(refreshError => {
-                this.platform.log.error(
-                  `${this.accessory.displayName}: Failed to refresh status after error: ${errorMessage(refreshError)}`,
-                );
-              });
-          });
+        // Queue rather than send. A slider drag emits many writes in a second or two
+        // and only the final value matters; the optimistic update above has already
+        // moved the UI, so the short delay is invisible.
+        this.queueTemperatureCommand(client, device, apiTemp);
       });
 
     // TemperatureDisplayUnits is a writable characteristic on Service.Thermostat.
@@ -581,7 +688,7 @@ export class SleepmePlatformAccessory {
     // Schedule the next poll with the new interval
     this.scheduleNextCheck(async () => {
       const {apiKey, device} = this.accessory.context as SleepmeContext;
-      const client = new Client(apiKey, undefined, this.platform.log);
+      const client = this.platform.clientFor(apiKey);
       this.platform.log.debug(`Polling device status for ${this.accessory.displayName}`);
       const r = await client.getDeviceStatus(device.id);
       this.platform.log.debug(`Response (${this.accessory.displayName}): ${r.status}`);
@@ -660,7 +767,13 @@ export class SleepmePlatformAccessory {
           this.scheduleNextCheck(poller);
         })
         .catch(error => {
-          this.platform.log.error(`${this.accessory.displayName}: Error polling device after retries: ${errorMessage(error)}`);
+          if (error instanceof RateLimitDeferredError) {
+            this.platform.log.debug(`${this.accessory.displayName}: ${error.message}`);
+          } else {
+            this.platform.log.error(
+              `${this.accessory.displayName}: Error polling device after retries: ${errorMessage(error)}`,
+            );
+          }
           // Still schedule next check even if there was an error after all retries
           this.scheduleNextCheck(poller);
         });

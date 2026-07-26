@@ -44,7 +44,14 @@ There are additional configuration options that can be set to tailor the plugin 
 * **Low Water Level Alert Type**: _None, battery, leak, or motion_. Select the type of virtual sensor that will be generated to represent the water level of your device. By default, "battery" is used and the water level will be represented as the thermostat device's battery level. Leak sensor or motion sensor may be preferable for purposes of using Apple home automations triggered by "leak detected" or "motion detected".
 * **Device ID Allowlist**: Optional. By default, every device on your account that reports the Dock Pro model is added. If you list device IDs here, only those devices are added. Device IDs appear in the Homebridge log in the "Adding new accessory" and "Skipping" messages.
 * **Supported Models**: Optional. Defaults to `DP999NA` (Dock Pro). Devices reporting any other model are skipped, because other SleepMe products do not expose the water level and water temperature fields this plugin drives — a Sleep Tracker (`ST501NA`), for example, would otherwise appear as a thermostat whose readings never change. If SleepMe releases a Dock Pro with a new model code, add it here.
-* **API Polling Interval**: These values represent the amount of time that the plugin will wait between each poll of the sleepme API to check for device status updates. The default values of 45 seconds when active and 15 minutes when on standby have been tested to be adequate for avoiding API rate limits when polling TWO dock pro devices. These values can probably be reduced, if you want, if you only have one dock pro. The plugin will automatically back off and retry failed API commands.
+* **API Polling Interval**: How long the plugin waits between polls of the SleepMe API. **You should not normally need to change this.** The SleepMe API allows [10 requests per minute per account](https://docs.developer.sleep.me/docs/), and the plugin keeps itself under that automatically:
+  * It tracks its own request rate against each minute window and holds part of the budget in reserve, so commands you send from the Home app are never blocked by background polling.
+  * The active interval scales with how many devices share your API token. A setting of 10 seconds means 10 seconds with one device, 20 with two, 30 with three. A value already above that floor is used exactly as configured, so the 45 second default stays 45 seconds no matter how many docks you have.
+  * Repeated commands that would not change anything — setting the temperature to what it already is, or turning on a dock that is already on — are skipped rather than sent.
+  * Dragging the temperature slider sends one request for the value you settle on, not one per step along the way.
+  * Failed calls are retried with exponential backoff, and polls are skipped rather than retried when the budget is spent.
+
+  Standby polling is not scaled, because at the 15 minute default it costs almost nothing.
 
 ## Automation Examples
 

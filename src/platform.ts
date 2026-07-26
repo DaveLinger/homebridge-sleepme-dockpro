@@ -1,7 +1,8 @@
 // filename: src/platform.ts
 import {API, DynamicPlatformPlugin, Logging, PlatformAccessory, Service, Characteristic} from 'homebridge';
 
-import {Client, DeviceStatus} from './sleepme/client.js';
+import {Client, Device, DeviceStatus} from './sleepme/client.js';
+import {RateLimiter, RateLimitDeferredError} from './sleepme/rateLimiter.js';
 
 import {PLATFORM_NAME, PLUGIN_NAME} from './settings.js';
 import {SleepmePlatformAccessory} from './platformAccessory.js';
@@ -59,6 +60,21 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
   // this is used to track restored cached accessories
   public readonly accessories: PlatformAccessory[] = [];
 
+  // One Client (and therefore one RateLimiter) per API token. The API quota is per
+  // account, so every device behind a token has to share an instance for the limiter
+  // to observe the account's real request rate.
+  private readonly clients = new Map<string, Client>();
+
+  /** Returns the shared Client for an API token, creating it on first use. */
+  public clientFor(apiKey: string): Client {
+    let client = this.clients.get(apiKey);
+    if (!client) {
+      client = new Client(apiKey, undefined, this.log, new RateLimiter());
+      this.clients.set(apiKey, client);
+    }
+    return client;
+  }
+
   constructor(
     public readonly log: Logging,
     public readonly config: PluginConfig,
@@ -92,6 +108,37 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
   }
 
   /**
+   * Reads a device's status during discovery, waiting out the rate limit window if
+   * the polling budget is momentarily exhausted.
+   *
+   * Startup issues one device-list call plus one status call per device in a burst.
+   * On an account with more devices than the per-minute polling budget, the later
+   * ones would otherwise be deferred and silently lose their model check.
+   */
+  private async statusForDiscovery(client: Client, device: Device): Promise<DeviceStatus | undefined> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return (await client.getDeviceStatus(device.id)).data;
+      } catch (error) {
+        if (error instanceof RateLimitDeferredError && attempt === 0) {
+          this.log.debug(
+            `Discovery of "${device.name}" is waiting ${Math.ceil(error.retryAfterMs / 1000)}s ` +
+            'for the rate limit window to reset.',
+          );
+          await new Promise(resolve => setTimeout(resolve, error.retryAfterMs + 50));
+          continue;
+        }
+        this.log.warn(
+          `Could not read status for "${device.name}" (${device.id}) during discovery: ${errorMessage(error)}. ` +
+          'Adding it anyway without a model check.',
+        );
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * This is an example method showing how to register discovered accessories.
    * Accessories must only be registered once, previously created accessories
    * must not be registered again to prevent "duplicate UUID" errors.
@@ -109,8 +156,13 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
     }
 
     this.config.api_keys.forEach(key => {
-      const client = new Client(key, undefined, this.log);
+      const client = this.clientFor(key);
       client.listDevices().then(async r => {
+        // Pass 1: filter. The per-device polling interval scales with how many
+        // devices share this token's quota, so the count has to be known before
+        // any accessory is constructed.
+        const accepted: Array<{device: Device; initialStatus?: DeviceStatus}> = [];
+
         for (const device of r.data) {
           if (allowedIds.length > 0 && !allowedIds.includes(device.id)) {
             this.log.info(`Skipping "${device.name}" (${device.id}): not in the configured device ID allowlist`);
@@ -120,15 +172,7 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
           // The device list does not include the model, so read the status here to
           // identify it. The status is handed to the accessory below so it does not
           // fetch again, keeping startup at one status call per device.
-          let initialStatus: DeviceStatus | undefined;
-          try {
-            initialStatus = (await client.getDeviceStatus(device.id)).data;
-          } catch (error) {
-            this.log.warn(
-              `Could not read status for "${device.name}" (${device.id}) during discovery: ${errorMessage(error)}. ` +
-              'Adding it anyway without a model check.',
-            );
-          }
+          const initialStatus = await this.statusForDiscovery(client, device);
 
           // Only skip on a model we positively identified as unsupported. If the status
           // call failed we add the device rather than risk dropping a working dock.
@@ -142,6 +186,17 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
             continue;
           }
 
+          accepted.push({device, initialStatus});
+        }
+
+        if (accepted.length === 0) {
+          this.log.warn('No supported Dock Pro devices found for this API token.');
+          return;
+        }
+
+        // Pass 2: register. accepted.length is the number of devices sharing this
+        // token's 10-requests-per-minute quota.
+        for (const {device, initialStatus} of accepted) {
           const uuid = this.api.hap.uuid.generate(device.id);
           const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
           if (existingAccessory) {
@@ -154,7 +209,7 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
 
             // create the accessory handler for the restored accessory
             // this is imported from `platformAccessory.ts`
-            new SleepmePlatformAccessory(this, existingAccessory, initialStatus);
+            new SleepmePlatformAccessory(this, existingAccessory, initialStatus, accepted.length);
 
             // it is possible to remove platform accessories at any time using `api.unregisterPlatformAccessories`, e.g.:
             // remove platform accessories when no longer present
@@ -173,7 +228,7 @@ export class SleepmePlatform implements DynamicPlatformPlugin {
 
             // create the accessory handler for the newly create accessory
             // this is imported from `platformAccessory.ts`
-            new SleepmePlatformAccessory(this, accessory, initialStatus);
+            new SleepmePlatformAccessory(this, accessory, initialStatus, accepted.length);
             // link the accessory to your platform
             this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
           }
